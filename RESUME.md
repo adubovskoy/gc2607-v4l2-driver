@@ -20,8 +20,11 @@ Camera starts automatically at boot via systemd service. No manual commands need
 
 ## After Fedora Kernel Updates
 
-The modified `ipu_bridge.ko` gets replaced. Fix:
+DKMS automatically rebuilds both modules. Just reboot into the new kernel.
 
+Check status: `dkms status`
+
+If DKMS fails (check `journalctl -u dkms`):
 ```bash
 cd ~/dev/gc2607-v4l2-driver
 sudo ./gc2607-install.sh

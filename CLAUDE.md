@@ -89,7 +89,8 @@ The entire driver is in `gc2607.c`. Key sections by function:
 
 ## Key Scripts
 
-- `gc2607-install.sh` — Build and install both modules (gc2607 + patched ipu-bridge) for current kernel
+- `dkms-setup.sh` — Set up DKMS for automatic module rebuilds on kernel updates (one-time setup)
+- `gc2607-install.sh` — Manually build and install both modules (fallback if DKMS not set up)
 - `gc2607-setup-service.sh` — Install systemd service for auto-start at boot (one-time setup)
 - `gc2607-service.sh` — Service script: loads modules, configures pipeline, starts virtualcam (called by systemd)
 - `gc2607_virtualcam.py` — Real-time virtual camera: demosaic + auto-WB + auto-exposure + sRGB gamma (installed to `/opt/gc2607/` by setup script)
@@ -101,12 +102,17 @@ The entire driver is in `gc2607.c`. Key sections by function:
 
 ## After Fedora Kernel Updates
 
-The modified `ipu_bridge.ko` gets replaced by the stock Fedora one on every kernel update, breaking the camera. Fix:
+DKMS automatically rebuilds both modules (gc2607 + patched ipu-bridge) on kernel updates. No manual steps needed — just reboot into the new kernel.
 
+To check DKMS status: `dkms status`
+
+If DKMS wasn't set up or the automatic rebuild fails:
 ```bash
-sudo ./gc2607-install.sh   # rebuilds both modules for the new kernel
-sudo reboot                # camera service starts automatically
+sudo ./gc2607-install.sh   # manually rebuilds both modules
+sudo reboot
 ```
+
+To set up DKMS (one-time): `sudo ./dkms-setup.sh`
 
 ## Common Pitfalls
 
