@@ -21,6 +21,9 @@ WIDTH = 1920
 HEIGHT = 1080
 FRAME_SIZE = WIDTH * HEIGHT * 2  # 10-bit packed as uint16
 
+# Hardware black level (noise floor) - found to be 64 via raw analysis
+BLACK_LEVEL = 64
+
 # Output is half resolution (2x2 demosaic)
 OUT_W = WIDTH // 2   # 960
 OUT_H = HEIGHT // 2  # 540
@@ -77,10 +80,11 @@ def process_frame(raw_bytes, prev_gains, brightness):
     bayer = np.frombuffer(raw_bytes, dtype=np.uint16).reshape(HEIGHT, WIDTH)
 
     # Extract channels (GRBG pattern) - produces half-resolution output
-    g1 = bayer[0::2, 0::2].astype(np.float32)
-    r  = bayer[0::2, 1::2].astype(np.float32)
-    b  = bayer[1::2, 0::2].astype(np.float32)
-    g2 = bayer[1::2, 1::2].astype(np.float32)
+    # Subtract hardware black level and clip to 0
+    g1 = np.maximum(bayer[0::2, 0::2].astype(np.float32) - BLACK_LEVEL, 0)
+    r  = np.maximum(bayer[0::2, 1::2].astype(np.float32) - BLACK_LEVEL, 0)
+    b  = np.maximum(bayer[1::2, 0::2].astype(np.float32) - BLACK_LEVEL, 0)
+    g2 = np.maximum(bayer[1::2, 1::2].astype(np.float32) - BLACK_LEVEL, 0)
     g  = (g1 + g2) * 0.5
 
     # Gray-world white balance (green as reference)
@@ -88,6 +92,7 @@ def process_frame(raw_bytes, prev_gains, brightness):
     g_avg = g.mean()
     b_avg = b.mean()
 
+    # Use a small epsilon to avoid division by zero
     r_gain = g_avg / (r_avg + 1e-6)
     b_gain = g_avg / (b_avg + 1e-6)
 
@@ -100,7 +105,8 @@ def process_frame(raw_bytes, prev_gains, brightness):
     b *= b_gain
 
     # Normalize 10-bit to [0,1] with brightness
-    scale = brightness / 1023.0
+    # Since we subtracted 64, the new max is 1023 - 64 = 959
+    scale = brightness / 959.0
     r = np.clip(r * scale, 0, 1)
     g = np.clip(g * scale, 0, 1)
     b = np.clip(b * scale, 0, 1)
