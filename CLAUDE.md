@@ -5,8 +5,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test Commands
 
 ```bash
-# Build the out-of-tree kernel module
+# Build everything (kernel module + userspace ISP)
 make
+
+# Build only the kernel module
+make modules
+
+# Build only the userspace ISP program
+make isp
 
 # Clean build artifacts
 make clean
@@ -39,14 +45,28 @@ V4L2 Linux kernel driver for the GalaxyCore GC2607 camera sensor, ported from th
 gc2607 sensor (SGRBG10 raw 10-bit Bayer)
   → Intel IPU6 CSI2 0
   → Intel IPU6 ISYS Capture 0 (/dev/videoN)
-  → gc2607_virtualcam.py (demosaic + auto-WB + auto-exposure + gamma)
-  → v4l2loopback /dev/video50 ("GC2607 Camera")
+  → gc2607_isp (C: demosaic + auto-WB + auto-exposure + gamma via per-channel LUT)
+  → v4l2loopback /dev/video50 ("GC2607 Camera", YUYV 960x540)
   → PipeWire → camera apps (GNOME Camera, Chrome, OBS, etc.)
 ```
 
-### Why Python virtualcam instead of GStreamer?
+### Userspace ISP (`gc2607_isp.c`)
 
-GStreamer's `bayer2rgb` element produces output with green at ~1.7x red/blue from 10-bit Bayer data. No combination of post-processing filters (frei0r coloradj-rgb, normaliz0r, white-balance) could adequately fix this. The Python virtualcam (`gc2607_virtualcam.py`) does its own demosaicing at 10-bit precision with per-frame gray-world white balance — the same algorithm as `view_raw_wb.py` which produces correct colors. It also applies sRGB gamma correction and auto-exposure.
+A lightweight C program that replaced the original Python virtualcam (`gc2607_virtualcam.py`). Uses ~4-5% CPU (down from ~43% with Python/NumPy).
+
+**Key design: per-channel LUT.** All per-pixel operations (black level subtract → WB gain → brightness → S-curve contrast → sRGB gamma) are composed into three 1024-entry LUTs (one per R/G/B channel), recomputed once per frame. Per-pixel work is a single table lookup per channel.
+
+- **V4L2 MMAP capture** — direct kernel buffers, no subprocess overhead
+- **Gray-world auto white balance** — no manual offsets, pure `g_mean/r_mean` and `g_mean/b_mean`
+- **Hardware + software auto-exposure** — software brightness multiplier for fast response, hardware exposure/gain adjustment for range
+- **YUYV output** — writes directly to v4l2loopback, no intermediate RGB conversion library
+- **180° rotation** — zero-cost via reverse iteration during output
+
+### Why C ISP instead of Python or GStreamer?
+
+- **GStreamer**: `bayer2rgb` only supports 8-bit Bayer and produces green tint from 10-bit data
+- **Python/NumPy**: Works correctly but uses ~43% CPU due to interpreter overhead, multiple array passes, subprocess capture, and Python RGB→YUYV conversion
+- **C with LUT**: All per-pixel math collapses into a single table lookup. Direct V4L2 MMAP avoids copy overhead. ~4-5% CPU on Intel Ultra 9.
 
 ### Driver (gc2607.c — single file, ~1000 lines)
 
@@ -64,8 +84,8 @@ The entire driver is in `gc2607.c`. Key sections by function:
 - **ACPI matching** (not DT): Uses HID "GCTI2607" since target is x86_64 laptop
 - **INT3472 PMIC**: Power/reset/clock managed through Intel's discrete PMIC driver, not direct GPIO
 - **Gain via LUT**: Analogue gain uses a 17-entry lookup table (index 0-16) that writes to 4 registers simultaneously, matching the reference driver's approach
-- **No hardware WB**: Sensor has no white balance registers; WB is done per-frame in `gc2607_virtualcam.py` using gray-world algorithm
-- **Auto-exposure in software**: `gc2607_virtualcam.py` measures median luma and adjusts a digital brightness multiplier + sensor exposure/gain to maintain target brightness (median=128)
+- **No hardware WB**: Sensor has no white balance registers; WB is done per-frame in `gc2607_isp` using gray-world algorithm
+- **Auto-exposure in software**: `gc2607_isp` measures green channel mean and adjusts software brightness + sensor hardware exposure/gain to maintain target brightness
 - **IPU6 bridge patch required**: The stock `ipu_bridge.ko` doesn't know about GC2607. A modified version with `IPU_SENSOR_CONFIG("GCTI2607", 1, 336000000)` must be installed (see `0001-media-ipu-bridge-*.patch`)
 - **Wireplumber rule hides raw IPU6 nodes**: Without this, camera apps try to use raw IPU6 devices instead of the virtual camera. Config at `~/.config/wireplumber/wireplumber.conf.d/50-hide-ipu6-raw.conf`
 
@@ -87,14 +107,15 @@ The entire driver is in `gc2607.c`. Key sections by function:
 | ACPI device | GCTI2607:00 at \_SB_.PC00.LNK0 |
 | PMIC | INT3472:01 (discrete), provides regulator + reset GPIO + clock |
 
-## Key Scripts
+## Key Files
 
+- `gc2607_isp.c` — **Userspace C ISP**: demosaic + auto-WB + auto-AE + gamma via per-channel LUT (~4-5% CPU)
+- `gc2607_virtualcam.py` — Legacy Python ISP (fallback if C ISP not built)
 - `dkms-setup.sh` — Set up DKMS for automatic module rebuilds on kernel updates (one-time setup)
 - `gc2607-install.sh` — Manually build and install both modules (fallback if DKMS not set up)
 - `gc2607-setup-service.sh` — Install systemd service for auto-start at boot (one-time setup)
-- `gc2607-service.sh` — Service script: loads modules, configures pipeline, starts virtualcam (called by systemd)
-- `gc2607_virtualcam.py` — Real-time virtual camera: demosaic + auto-WB + auto-exposure + sRGB gamma (installed to `/opt/gc2607/` by setup script)
-- `gc2607-restart-wireplumber.sh` — Restarts wireplumber after virtualcam starts (called by systemd)
+- `gc2607-service.sh` — Service script: loads modules, configures pipeline, starts ISP (called by systemd)
+- `gc2607-restart-wireplumber.sh` — Restarts wireplumber after ISP starts (called by systemd)
 - `gc2607-start.sh` — Manual start (alternative to systemd service)
 - `gc2607-reload.sh` — Hot-reload modules without reboot (when possible)
 - `gc2607-test.sh` — Capture a single frame and convert to PNG
@@ -118,11 +139,11 @@ To set up DKMS (one-time): `sudo ./dkms-setup.sh`
 
 - **Format mismatch on stream start**: Video device must use pixelformat=BA10 (not GB10) to match sensor's GRBG Bayer pattern
 - **Reset sequence**: Reset GPIO must end de-asserted (HIGH) or sensor won't respond to I2C
-- **Green tint in GStreamer**: GStreamer's `bayer2rgb` outputs green at 1.7x red/blue from 10-bit Bayer. Use `gc2607_virtualcam.py` instead, which does proper demosaicing with per-frame WB
+- **Green tint in GStreamer**: GStreamer's `bayer2rgb` outputs green at 1.7x red/blue from 10-bit Bayer. Use `gc2607_isp` instead, which does proper demosaicing with per-frame WB
 - **Media link must be enabled**: `media-ctl -l` command required before streaming (done by `gc2607-service.sh`)
 - **CSI2 format must be set**: CSI2 pads default to 4096x3072; must set to 1920x1080 or streaming fails with broken pipe
 - **Module xz compression**: Fedora's kernel module loader expects `xz --check=crc32`. Default xz uses CRC64 which causes `decompression failed with status 6`
 - **Home directory permissions**: systemd services may not access home dirs (mode 700). Scripts are installed to `/opt/gc2607/`
 - **PipeWire/wireplumber**: Must restart wireplumber after v4l2loopback loads so camera apps see the device. Must also hide raw IPU6 nodes via wireplumber rule or apps pick wrong device
-- **Python path**: `gc2607-setup-service.sh` finds a Python with `numpy` + `pyfakewebcam` at install time and saves to `/opt/gc2607/.python-path`. Needed because systemd can't access home dirs (mode 700) to auto-detect at boot
-- **pyfakewebcam numpy fix**: `pyfakewebcam` uses deprecated `tostring()` — patched to `tobytes()` in miniconda install
+- **Python path** (legacy fallback only): `gc2607-setup-service.sh` finds a Python with `numpy` + `pyfakewebcam` at install time and saves to `/opt/gc2607/.python-path`. Only used if `gc2607_isp` binary is not available
+- **Color tinge with manual WB offsets**: Never add manual R/G/B offset multipliers to the WB algorithm. Pure gray-world (`g_mean/r_mean`, `g_mean/b_mean`, green=1.0) produces correct colors. Manual offsets cause scene-dependent color shifts

@@ -14,7 +14,7 @@ INSTALL_DIR="/opt/gc2607"
 USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
 USER_HOME=$(getent passwd "$USER" | cut -d: -f6)
 
-# Find python3 with required packages
+# Find python3 with required packages (used as fallback if C ISP not available)
 find_python() {
     for p in /usr/bin/python3 /usr/local/bin/python3; do
         if "$p" -c "import numpy, pyfakewebcam" 2>/dev/null; then
@@ -29,7 +29,6 @@ find_python() {
     echo "python3"
 }
 PYTHON="$(find_python)"
-echo "Using Python: ${PYTHON}"
 echo "User: ${USER}"
 
 echo "=== Installing GC2607 Camera Service ==="
@@ -37,17 +36,29 @@ echo "=== Installing GC2607 Camera Service ==="
 # Stop existing instances
 echo "Stopping any running instances..."
 systemctl stop gc2607-camera.service 2>/dev/null || true
+kill $(pgrep -f gc2607_isp) 2>/dev/null || true
 kill $(pgrep -f gc2607_virtualcam) 2>/dev/null || true
-kill $(pgrep -f "gst-launch.*video1.*bayer2rgb") 2>/dev/null || true
 sleep 1
 
-# Copy scripts to /opt where systemd can access them
-echo "Installing scripts to ${INSTALL_DIR}..."
+# Build the C ISP if not already built
+if [ ! -f "${SCRIPT_DIR}/gc2607_isp" ]; then
+    echo "Building gc2607_isp..."
+    if command -v gcc &>/dev/null; then
+        gcc -O2 -Wall -march=native -o "${SCRIPT_DIR}/gc2607_isp" "${SCRIPT_DIR}/gc2607_isp.c" -lm
+    else
+        echo "Warning: gcc not found, will use Python virtualcam fallback"
+    fi
+fi
+
+# Copy scripts and binary to /opt where systemd can access them
+echo "Installing to ${INSTALL_DIR}..."
 mkdir -p "$INSTALL_DIR"
 cp "${SCRIPT_DIR}/gc2607_virtualcam.py" "$INSTALL_DIR/"
 cp "${SCRIPT_DIR}/gc2607-service.sh" "$INSTALL_DIR/"
 cp "${SCRIPT_DIR}/gc2607-restart-wireplumber.sh" "$INSTALL_DIR/"
+[ -f "${SCRIPT_DIR}/gc2607_isp" ] && cp "${SCRIPT_DIR}/gc2607_isp" "$INSTALL_DIR/"
 chmod +x "$INSTALL_DIR"/*.sh "$INSTALL_DIR"/*.py
+[ -f "$INSTALL_DIR/gc2607_isp" ] && chmod +x "$INSTALL_DIR/gc2607_isp"
 
 # Update service script to use /opt paths
 sed -i "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"${INSTALL_DIR}\"|" "$INSTALL_DIR/gc2607-service.sh"

@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 """
-Real-time virtual camera for GC2607 sensor.
-
-Captures raw 10-bit GRBG Bayer from the sensor, applies proper demosaicing,
-per-frame gray-world white balance, sRGB gamma, and auto-exposure.
-
-Usage:
-    sudo python3 gc2607_virtualcam.py [capture_dev] [output_dev]
+GC2607 Virtual Camera - Final Performance & Quality Tune
 """
-
 import sys
 import subprocess
 import time
@@ -19,22 +12,20 @@ import pyfakewebcam
 # Sensor parameters
 WIDTH = 1920
 HEIGHT = 1080
-FRAME_SIZE = WIDTH * HEIGHT * 2  # 10-bit packed as uint16
+FRAME_SIZE = WIDTH * HEIGHT * 2 
+BLACK_LEVEL = 48  # Lowered to preserve shadow detail
+OUT_W = WIDTH // 2
+OUT_H = HEIGHT // 2
 
-# Hardware black level (noise floor) - found to be 64 via raw analysis
-BLACK_LEVEL = 64
+# White Balance (Faster but smoother)
+WB_SMOOTHING = 0.30
+R_OFFSET = 1.05
+G_OFFSET = 0.75
+B_OFFSET = 1.05
 
-# Output is half resolution (2x2 demosaic)
-OUT_W = WIDTH // 2   # 960
-OUT_H = HEIGHT // 2  # 540
-
-# WB smoothing (0-1, higher = more stable, less responsive)
-WB_SMOOTHING = 0.85
-
-# Auto-exposure target: median brightness in [0,255] output
-# 128 = middle gray (standard 18% gray card target for AE)
-AE_TARGET = 128
-AE_SMOOTHING = 0.95  # slow adjustment to prevent flicker
+# Auto-exposure (Balanced Target)
+AE_TARGET = 85 
+AE_SMOOTHING = 0.90
 
 # Sensor limits
 EXPOSURE_MIN = 4
@@ -44,205 +35,165 @@ GAIN_MAX = 16
 
 running = True
 
+def create_isp_lut():
+    x = np.linspace(0, 1, 1024, dtype=np.float32)
+    s_curve = x * x * (3 - 2 * x)
+    gamma = np.power(np.clip(s_curve, 0, 1), 1.0 / 2.2)
+    return (gamma * 255).astype(np.uint8)
+
+ISP_LUT = create_isp_lut()
+
+# PRE-ALLOCATED BUFFERS (CRITICAL FOR CPU)
+# We use one large 3D array for the whole RGB frame to avoid stacking
+_rgb_float = np.zeros((OUT_H, OUT_W, 3), dtype=np.float32)
+# View references for easier channel access without copying
+_r = _rgb_float[:, :, 0]
+_g = _rgb_float[:, :, 1]
+_b = _rgb_float[:, :, 2]
 
 def signal_handler(sig, frame):
     global running
     running = False
 
-
 def set_sensor_controls(subdev, exposure, gain):
-    """Set sensor exposure and gain via v4l2-ctl."""
     exposure = int(np.clip(exposure, EXPOSURE_MIN, EXPOSURE_MAX))
     gain = int(np.clip(gain, GAIN_MIN, GAIN_MAX))
-    subprocess.run(
-        ['v4l2-ctl', '-d', subdev,
-         '--set-ctrl', f'exposure={exposure},analogue_gain={gain}'],
-        capture_output=True
-    )
+    subprocess.run(['v4l2-ctl', '-d', subdev, '--set-ctrl', f'exposure={exposure},analogue_gain={gain}'], capture_output=True)
     return exposure, gain
 
-
 def find_sensor_subdev():
-    """Find the v4l-subdev with exposure control."""
     import glob
     for sd in sorted(glob.glob('/dev/v4l-subdev*')):
-        result = subprocess.run(
-            ['v4l2-ctl', '-d', sd, '--list-ctrls'],
-            capture_output=True, text=True
-        )
+        result = subprocess.run(['v4l2-ctl', '-d', sd, '--list-ctrls'], capture_output=True, text=True)
         if 'exposure' in result.stdout:
             return sd
     return None
 
-
 def process_frame(raw_bytes, prev_gains, brightness):
-    """Demosaic raw Bayer GRBG10 and apply gray-world white balance."""
+    global _rgb_float, _r, _g, _b
+    # Fast read of uint16 Bayer
     bayer = np.frombuffer(raw_bytes, dtype=np.uint16).reshape(HEIGHT, WIDTH)
 
-    # Extract channels (GRBG pattern) - produces half-resolution output
-    # Subtract hardware black level and clip to 0
-    g1 = np.maximum(bayer[0::2, 0::2].astype(np.float32) - BLACK_LEVEL, 0)
-    r  = np.maximum(bayer[0::2, 1::2].astype(np.float32) - BLACK_LEVEL, 0)
-    b  = np.maximum(bayer[1::2, 0::2].astype(np.float32) - BLACK_LEVEL, 0)
-    g2 = np.maximum(bayer[1::2, 1::2].astype(np.float32) - BLACK_LEVEL, 0)
-    g  = (g1 + g2) * 0.5
+    # 1. Direct extraction into pre-allocated float buffers
+    # Bayer GRBG: [0,0]=G1, [0,1]=R, [1,0]=B, [1,1]=G2
+    _r[:,:] = bayer[0::2, 1::2]
+    _b[:,:] = bayer[1::2, 0::2]
+    
+    # Green is average of G1 and G2
+    g1 = bayer[0::2, 0::2]
+    g2 = bayer[1::2, 1::2]
+    np.add(g1, g2, out=_g)
+    _g *= 0.5
 
-    # Gray-world white balance (green as reference)
-    r_avg = r.mean()
-    g_avg = g.mean()
-    b_avg = b.mean()
+    # 2. Subtract black level
+    _r -= BLACK_LEVEL
+    _g -= BLACK_LEVEL
+    _b -= BLACK_LEVEL
+    
+    # Capture raw median for AE loop BEFORE any software gains
+    raw_median = np.median(_g[::8, ::8])
 
-    # Use a small epsilon to avoid division by zero
-    r_gain = g_avg / (r_avg + 1e-6)
-    b_gain = g_avg / (b_avg + 1e-6)
+    # 3. White Balance Calculation (Gray World)
+    r_avg = _r.mean()
+    g_avg = _g.mean()
+    b_avg = _b.mean()
 
-    # Smooth gains across frames to prevent flicker
+    r_gain = (g_avg / (r_avg + 1e-6)) * R_OFFSET
+    b_gain = (g_avg / (b_avg + 1e-6)) * B_OFFSET
+    
     if prev_gains is not None:
         r_gain = WB_SMOOTHING * prev_gains[0] + (1 - WB_SMOOTHING) * r_gain
         b_gain = WB_SMOOTHING * prev_gains[1] + (1 - WB_SMOOTHING) * b_gain
 
-    r *= r_gain
-    b *= b_gain
-
-    # Normalize 10-bit to [0,1] with brightness
-    # Since we subtracted 64, the new max is 1023 - 64 = 959
+    # 4. Apply Scaling & WB Gains in-place
+    # Max sensor is ~959. Scale to [0, 1]
     scale = brightness / 959.0
-    r = np.clip(r * scale, 0, 1)
-    g = np.clip(g * scale, 0, 1)
-    b = np.clip(b * scale, 0, 1)
+    _r *= (r_gain * scale)
+    _g *= (G_OFFSET * scale)
+    _b *= (b_gain * scale)
 
-    # sRGB gamma correction (linear → perceptual)
-    r = np.power(r, 1.0 / 2.2)
-    g = np.power(g, 1.0 / 2.2)
-    b = np.power(b, 1.0 / 2.2)
+    # 5. Simple Cross-talk reduction (Slightly desaturate shadows)
+    _r -= 0.05 * _g
+    _b -= 0.05 * _g
+    
+    # 6. Apply LUT via fast indexing
+    # Clip and map to 0-1023
+    rgb_idx = (np.clip(_rgb_float, 0, 1) * 1023).astype(np.uint16)
+    rgb_8bit = np.take(ISP_LUT, rgb_idx)
+    
+    # Rotate 180 (In-place flipping is faster)
+    rgb_8bit = np.ascontiguousarray(rgb_8bit[::-1, ::-1])
 
-    # Convert to 8-bit
-    rgb = np.stack([r * 255, g * 255, b * 255], axis=2).astype(np.uint8)
-    # Rotate 180°
-    rgb = rgb[::-1, ::-1]
-
-    # Measure median brightness for auto-exposure feedback
-    luma = (0.299 * rgb[:,:,0].astype(np.float32) +
-            0.587 * rgb[:,:,1].astype(np.float32) +
-            0.114 * rgb[:,:,2].astype(np.float32))
-    median_luma = np.median(luma)
-
-    return rgb, (r_gain, b_gain), median_luma
-
+    return rgb_8bit, (r_gain, b_gain), raw_median
 
 def main():
     global running
-
     capture_dev = sys.argv[1] if len(sys.argv) > 1 else '/dev/video1'
     output_dev = sys.argv[2] if len(sys.argv) > 2 else '/dev/video50'
 
-    print(f"GC2607 Virtual Camera")
-    print(f"  Capture: {capture_dev} ({WIDTH}x{HEIGHT} BA10)")
-    print(f"  Output:  {output_dev} ({OUT_W}x{OUT_H} RGB)")
-    print(f"  Auto WB + Auto Exposure (target median={AE_TARGET})")
-    print()
-
+    print("GC2607 Virtual Camera (Stability Tune)")
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Find sensor subdev for exposure control
     subdev = find_sensor_subdev()
-    if subdev:
-        print(f"  Sensor subdev: {subdev}")
-    else:
-        print("  WARNING: No sensor subdev found, auto-exposure disabled")
-
-    # Set initial exposure
-    cur_exposure = 450
-    cur_gain = 7
+    # Initial defaults: avoid maxing out early
+    cur_exposure, cur_gain = 600, 4
     if subdev:
         set_sensor_controls(subdev, cur_exposure, cur_gain)
 
-    # Set up output via pyfakewebcam
-    print("Setting up virtual camera...")
-    cam = pyfakewebcam.FakeWebcam(output_dev, OUT_W, OUT_H)
+    try:
+        cam = pyfakewebcam.FakeWebcam(output_dev, OUT_W, OUT_H)
+    except:
+        subprocess.run(['v4l2-ctl', '-d', output_dev, '--set-fmt-video', f'width={OUT_W},height={OUT_H},pixelformat=RGB3'])
+        cam = pyfakewebcam.FakeWebcam(output_dev, OUT_W, OUT_H)
 
-    # Start v4l2-ctl streaming to stdout
-    print("Starting capture...")
-    proc = subprocess.Popen(
-        ['v4l2-ctl', '-d', capture_dev,
-         '--stream-mmap', '--stream-count=0',
-         '--stream-to=-'],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL
-    )
+    # Start capture with larger buffer for stability
+    proc = subprocess.Popen(['v4l2-ctl', '-d', capture_dev, '--stream-mmap', '--stream-count=0', '--stream-to=-'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=FRAME_SIZE*3)
 
-    print("Streaming... (Ctrl+C to stop)")
-    prev_gains = None
-    brightness = 1.0  # will be auto-adjusted
-    frame_count = 0
-    start_time = time.monotonic()
-    last_report = start_time
-    last_ae = start_time
+    prev_gains, brightness = None, 1.0
+    last_ae = time.monotonic()
     buf = b''
 
     try:
         while running and proc.poll() is None:
-            # Read one frame
             while len(buf) < FRAME_SIZE:
                 chunk = proc.stdout.read(FRAME_SIZE - len(buf))
-                if not chunk:
-                    running = False
-                    break
+                if not chunk: break
                 buf += chunk
-
-            if not running or len(buf) < FRAME_SIZE:
-                break
-
-            frame_data = buf[:FRAME_SIZE]
-            buf = buf[FRAME_SIZE:]
-
-            rgb, prev_gains, median_luma = process_frame(frame_data, prev_gains, brightness)
+            if not running or len(buf) < FRAME_SIZE: break
+            
+            frame_data = buf[:FRAME_SIZE]; buf = buf[FRAME_SIZE:]
+            rgb, prev_gains, raw_median = process_frame(frame_data, prev_gains, brightness)
             cam.schedule_frame(rgb)
 
-            # Auto-exposure: adjust brightness multiplier to hit target
-            # This is like a software AE loop — adjusts the digital gain
-            # to keep median brightness at AE_TARGET (128 = middle gray)
-            if median_luma > 0:
-                ae_ratio = AE_TARGET / median_luma
+            # Auto-exposure loop: Keep RAW median around a target
+            # This adjusts the SOFTWARE gain (brightness) first
+            # 90 / 1024 is roughly where we want the raw signal
+            target_raw = AE_TARGET * (959.0 / 255.0)
+            if raw_median > 0:
+                ae_ratio = target_raw / raw_median
                 brightness = AE_SMOOTHING * brightness + (1 - AE_SMOOTHING) * (brightness * ae_ratio)
-                brightness = np.clip(brightness, 0.3, 4.0)
+                brightness = np.clip(brightness, 0.5, 3.5)
 
-            # Adjust sensor exposure every 2 seconds if brightness is railing
             now = time.monotonic()
-            if subdev and now - last_ae >= 2.0:
+            if subdev and now - last_ae >= 1.5:
+                # If software gain is railing, adjust hardware
                 if brightness > 2.5 and cur_exposure < EXPOSURE_MAX:
-                    # Software gain maxing out — need more sensor exposure
-                    cur_exposure = min(int(cur_exposure * 1.3), EXPOSURE_MAX)
+                    cur_exposure = min(int(cur_exposure * 1.4), EXPOSURE_MAX)
                     if cur_exposure == EXPOSURE_MAX and cur_gain < GAIN_MAX:
                         cur_gain = min(cur_gain + 1, GAIN_MAX)
                     set_sensor_controls(subdev, cur_exposure, cur_gain)
-                    brightness = 1.0  # reset software gain
-                elif brightness < 0.5 and cur_exposure > EXPOSURE_MIN:
-                    # Too much light — reduce sensor exposure
+                    brightness = 1.0
+                elif brightness < 0.8 and cur_exposure > EXPOSURE_MIN:
                     cur_exposure = max(int(cur_exposure * 0.7), EXPOSURE_MIN)
                     if cur_exposure == EXPOSURE_MIN and cur_gain > GAIN_MIN:
                         cur_gain = max(cur_gain - 1, GAIN_MIN)
                     set_sensor_controls(subdev, cur_exposure, cur_gain)
                     brightness = 1.0
                 last_ae = now
-
-            frame_count += 1
-            if now - last_report >= 5.0:
-                fps = frame_count / (now - start_time)
-                print(f"  {frame_count} frames, {fps:.1f} fps, "
-                      f"WB: R={prev_gains[0]:.3f} B={prev_gains[1]:.3f}, "
-                      f"AE: exp={cur_exposure} gain={cur_gain} bright={brightness:.2f} "
-                      f"median={median_luma:.0f}")
-                last_report = now
-
+                
     finally:
         proc.terminate()
-        proc.wait()
-        elapsed = time.monotonic() - start_time
-        if elapsed > 0 and frame_count > 0:
-            print(f"\n{frame_count} frames in {elapsed:.1f}s = {frame_count/elapsed:.1f} fps")
-
 
 if __name__ == '__main__':
     main()

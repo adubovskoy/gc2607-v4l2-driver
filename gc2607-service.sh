@@ -8,12 +8,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Python path is written by gc2607-setup-service.sh at install time
-if [ -f "${SCRIPT_DIR}/.python-path" ]; then
-    PYTHON="$(cat "${SCRIPT_DIR}/.python-path")"
-else
-    PYTHON="python3"
-fi
 KVER="$(uname -r)"
 
 log() { echo "[gc2607] $*"; }
@@ -92,7 +86,18 @@ modprobe v4l2loopback \
 
 log "v4l2loopback loaded on /dev/video50"
 
-# ── Start Python virtualcam ─────────────────────────────────────────
+# ── Start C ISP (or fallback to Python virtualcam) ─────────────────
 
-log "Starting virtualcam (capture=$CAPTURE_DEV output=/dev/video50)..."
-exec "$PYTHON" "${SCRIPT_DIR}/gc2607_virtualcam.py" "$CAPTURE_DEV" /dev/video50
+log "Starting ISP (capture=$CAPTURE_DEV output=/dev/video50)..."
+if [ -x "${SCRIPT_DIR}/gc2607_isp" ]; then
+    exec "${SCRIPT_DIR}/gc2607_isp" "$CAPTURE_DEV" /dev/video50
+else
+    # Fallback to Python virtualcam
+    log "gc2607_isp not found, falling back to Python virtualcam"
+    if [ -f "${SCRIPT_DIR}/.python-path" ]; then
+        PYTHON="$(cat "${SCRIPT_DIR}/.python-path")"
+    else
+        PYTHON="python3"
+    fi
+    exec "$PYTHON" "${SCRIPT_DIR}/gc2607_virtualcam.py" "$CAPTURE_DEV" /dev/video50
+fi
