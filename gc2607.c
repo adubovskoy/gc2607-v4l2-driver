@@ -727,7 +727,12 @@ static int gc2607_detect(struct gc2607 *gc2607)
 }
 
 /*
- * Runtime PM operations
+ * Power management operations
+ *
+ * Used for both runtime PM (idle power savings) and system sleep
+ * (suspend/hibernate). Without SET_SYSTEM_SLEEP_PM_OPS, the kernel
+ * cannot power down the sensor during s2idle/S3, causing the IPU6
+ * ISYS to report -EBUSY and blocking system suspend entirely.
  */
 static int gc2607_runtime_suspend(struct device *dev)
 {
@@ -749,6 +754,7 @@ static int gc2607_runtime_resume(struct device *dev)
 }
 
 static const struct dev_pm_ops gc2607_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(gc2607_runtime_suspend, gc2607_runtime_resume)
 	SET_RUNTIME_PM_OPS(gc2607_runtime_suspend, gc2607_runtime_resume, NULL)
 };
 

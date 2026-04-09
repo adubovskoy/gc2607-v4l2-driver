@@ -96,13 +96,15 @@ cat > /etc/systemd/system/gc2607-camera.service << SVCEOF
 Description=GC2607 Camera Virtual Webcam
 After=multi-user.target graphical.target
 Wants=multi-user.target
+Conflicts=sleep.target
 
 [Service]
 Type=simple
 ExecStart=${INSTALL_DIR}/gc2607-service.sh
 ExecStartPost=${INSTALL_DIR}/gc2607-restart-wireplumber.sh
-Restart=on-failure
+Restart=on-abnormal
 RestartSec=5
+TimeoutStopSec=5
 StandardOutput=journal
 StandardError=journal
 

@@ -6,13 +6,18 @@
 Description=GC2607 Camera Virtual Webcam
 After=multi-user.target graphical.target
 Wants=multi-user.target
+# Stop the camera service before system suspend/hibernate so the IPU6
+# hardware can power down cleanly. The service restarts on resume.
+Conflicts=sleep.target
 
 [Service]
 Type=simple
 ExecStart=/opt/gc2607/gc2607-service.sh
 ExecStartPost=/opt/gc2607/gc2607-restart-wireplumber.sh
-Restart=on-failure
+# Only restart on crashes/signals, not clean shutdown (e.g. SIGTERM from sleep)
+Restart=on-abnormal
 RestartSec=5
+TimeoutStopSec=5
 StandardOutput=journal
 StandardError=journal
 

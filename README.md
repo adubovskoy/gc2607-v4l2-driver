@@ -83,37 +83,37 @@ make
 
 ## Usage
 
-### Quick Start - Capture Your First Image
+### Quick Start (After Reboot)
 
+1. **Initialize the camera** (loads modules and configures everything):
+   ```bash
+   sudo ./init_camera.sh
+   ```
+
+2. **Capture a test image**:
+   ```bash
+   ./quick_capture.sh
+   feh test.png
+   ```
+
+**Current Status**: 
+- ✅ Driver fully functional with exposure/gain controls
+- ✅ No post-processing needed - images are properly exposed natively
+
+### Manual Capture
 ```bash
-# 1. Load required kernel modules
-sudo modprobe videodev
-sudo modprobe v4l2-async
-sudo modprobe ipu_bridge
-sudo modprobe intel-ipu6
-sudo modprobe intel-ipu6-isys
-
-# 2. Load the GC2607 driver
+# 1. Load required modules
+sudo modprobe videodev v4l2-async ipu_bridge intel-ipu6 intel-ipu6-isys
 sudo insmod gc2607.ko
 
-# 3. Verify the sensor is detected
-media-ctl -d /dev/media0 --print-topology | grep gc2607
-# You should see: - entity 349: gc2607 5-0037 (...)
-
-# 4. Configure the video device format
+# 2. Configure video format and enable link
 v4l2-ctl -d /dev/video0 --set-fmt-video=width=1920,height=1080,pixelformat=BA10
-
-# 5. Enable the media pipeline link
 media-ctl -d /dev/media0 -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]'
 
-# 6. Capture an image
-v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=capture.raw
-
-# 7. Convert RAW to viewable PNG (with brightness boost)
-./view_raw_bright.py capture.raw 5.0
-
-# 8. View the image
-feh capture.png
+# 3. Capture raw image and view
+v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=myimage.raw
+./view_raw_bright.py myimage.raw 1.0
+feh test.png
 ```
 
 ### Automated Capture Script

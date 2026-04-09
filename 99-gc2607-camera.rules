@@ -1,0 +1,1 @@
+SUBSYSTEM=="video4linux", ATTR{name}=="GC2607 Camera", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}="gc2607-wireplumber-restart.service"
