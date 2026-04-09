@@ -10,6 +10,10 @@
  *   - 180° rotation
  * Outputs YUYV to v4l2loopback.
  *
+ * Lazy activation: the ISP idles with zero CPU usage until a consumer
+ * application opens /dev/video50. When all consumers close the device,
+ * the ISP stops streaming and releases the sensor hardware.
+ *
  * Usage: gc2607_isp <capture_dev> <output_dev>
  *   e.g. gc2607_isp /dev/video1 /dev/video50
  */
@@ -26,6 +30,8 @@
 #include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/inotify.h>
+#include <sys/select.h>
 #include <linux/videodev2.h>
 
 /* Sensor parameters */
@@ -60,14 +66,25 @@
 /* V4L2 capture buffers */
 #define NUM_BUFFERS     4
 
+/* Lazy activation: how often to write standby frames while idle (ms) */
+#define STANDBY_INTERVAL_MS  2000
+
+/* During streaming, how often to check if consumers are still present (s) */
+#define CONSUMER_CHECK_INTERVAL_S  2.0
+
 static volatile sig_atomic_t running = 1;
+
+/* inotify-based consumer tracking */
+static int inotify_fd = -1;
+static int inotify_wd = -1;
+static int consumer_count = 0;
 
 struct buffer {
     void   *start;
     size_t  length;
 };
 
-/* Per-channel LUTs: input 10-bit value → output 8-bit value */
+/* Per-channel LUTs: input 10-bit value -> output 8-bit value */
 static uint8_t lut_r[LUT_SIZE];
 static uint8_t lut_g[LUT_SIZE];
 static uint8_t lut_b[LUT_SIZE];
@@ -92,7 +109,7 @@ static int xioctl(int fd, unsigned long request, void *arg)
 
 /*
  * Build per-channel LUTs that encode the entire per-pixel pipeline:
- *   black_level_subtract → WB_gain → brightness_scale → S-curve → gamma
+ *   black_level_subtract -> WB_gain -> brightness_scale -> S-curve -> gamma
  *
  * Called once per frame with updated WB gains and brightness.
  */
@@ -150,14 +167,14 @@ static inline void rgb_to_yuyv(uint8_t r0, uint8_t g0, uint8_t b0,
 }
 
 /*
- * Process one Bayer frame → YUYV output with 180° rotation.
+ * Process one Bayer frame -> YUYV output with 180 degree rotation.
  *
  * Bayer GRBG pattern:
  *   Row 0: G R G R G R ...
  *   Row 1: B G B G B G ...
  *
- * 2x2 binning: each 2x2 block → one output pixel (R, avg(G1,G2), B).
- * 180° rotation: output rows/cols are reversed.
+ * 2x2 binning: each 2x2 block -> one output pixel (R, avg(G1,G2), B).
+ * 180 degree rotation: output rows/cols are reversed.
  *
  * Returns the subsampled green mean for AE.
  */
@@ -172,7 +189,7 @@ static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
     int stat_count = 0;
 
     /*
-     * Iterate output pixels in reverse for 180° rotation.
+     * Iterate output pixels in reverse for 180 degree rotation.
      * Output row (OUT_H-1-oy) col (OUT_W-1-ox) maps to Bayer block at (oy*2, ox*2).
      */
     for (int oy = 0; oy < OUT_H; oy++) {
@@ -217,24 +234,29 @@ static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
             uint8_t R0 = lut_r[r_0],  G0 = lut_g[gavg_0], B0 = lut_b[b_0];
             uint8_t R1 = lut_r[r_1],  G1 = lut_g[gavg_1], B1 = lut_b[b_1];
 
-            /* Write YUYV (flipped horizontally too for 180° rotation) */
+            /* Write YUYV (flipped horizontally too for 180 degree rotation) */
             int out_x = OUT_W - 2 - ox;
             /* Swap pixel order within the pair for horizontal flip */
             rgb_to_yuyv(R1, G1, B1, R0, G0, B0, out_row + out_x * 2);
 
-            /* Accumulate WB statistics (subsampled) */
+            /* Accumulate WB statistics (subsampled).
+             * Skip pixels where ANY channel is saturated (>=1020) —
+             * clipped values hide the true channel ratio, causing
+             * AWB to underestimate green dominance in bright scenes.
+             */
             if ((oy & (WB_SUBSAMPLE - 1)) == 0 && (ox & (WB_SUBSAMPLE - 1)) == 0) {
-                /* Use raw values after black level for stats */
-                float rv = (float)r_0 - BLACK_LEVEL;
-                float gv = (float)gavg_0 - BLACK_LEVEL;
-                float bv = (float)b_0 - BLACK_LEVEL;
-                if (rv < 0) rv = 0;
-                if (gv < 0) gv = 0;
-                if (bv < 0) bv = 0;
-                r_sum += rv;
-                g_sum += gv;
-                b_sum += bv;
-                stat_count++;
+                if (r_0 < 1020 && gavg_0 < 1020 && b_0 < 1020) {
+                    float rv = (float)r_0 - BLACK_LEVEL;
+                    float gv = (float)gavg_0 - BLACK_LEVEL;
+                    float bv = (float)b_0 - BLACK_LEVEL;
+                    if (rv < 0) rv = 0;
+                    if (gv < 0) gv = 0;
+                    if (bv < 0) bv = 0;
+                    r_sum += rv;
+                    g_sum += gv;
+                    b_sum += bv;
+                    stat_count++;
+                }
             }
         }
     }
@@ -284,6 +306,10 @@ static void set_sensor_controls(const char *subdev_path, int exposure, int gain)
     close(fd);
 }
 
+/*
+ * Open the capture device, set format, request and map buffers,
+ * and start streaming. Returns the fd on success, -1 on failure.
+ */
 static int open_capture(const char *dev, struct buffer *buffers, int *n_buffers)
 {
     int fd = open(dev, O_RDWR);
@@ -364,6 +390,23 @@ static int open_capture(const char *dev, struct buffer *buffers, int *n_buffers)
     return fd;
 }
 
+/*
+ * Stop streaming and close the capture device, unmapping all buffers.
+ */
+static void close_capture(int cap_fd, struct buffer *buffers, int n_buffers)
+{
+    if (cap_fd < 0)
+        return;
+
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    xioctl(cap_fd, VIDIOC_STREAMOFF, &type);
+
+    for (int i = 0; i < n_buffers; i++)
+        munmap(buffers[i].start, buffers[i].length);
+
+    close(cap_fd);
+}
+
 static int open_output(const char *dev)
 {
     int fd = open(dev, O_RDWR);
@@ -388,56 +431,119 @@ static int open_output(const char *dev)
     return fd;
 }
 
-int main(int argc, char *argv[])
+/*
+ * Initialise inotify watch on the output device.
+ * Watches for IN_OPEN and IN_CLOSE events so we know when consumers
+ * attach/detach without scanning /proc (which is fragile and slow).
+ *
+ * Must be called AFTER the ISP opens out_fd, so that our own open()
+ * is not counted.
+ */
+static int init_inotify(const char *output_dev)
 {
-    const char *capture_dev = argc > 1 ? argv[1] : "/dev/video1";
-    const char *output_dev  = argc > 2 ? argv[2] : "/dev/video50";
+    inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (inotify_fd < 0) {
+        perror("inotify_init1");
+        return -1;
+    }
 
-    /* Line-buffered stdout so logs appear in journald */
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    inotify_wd = inotify_add_watch(inotify_fd, output_dev,
+                                    IN_OPEN | IN_CLOSE);
+    if (inotify_wd < 0) {
+        perror("inotify_add_watch");
+        close(inotify_fd);
+        inotify_fd = -1;
+        return -1;
+    }
 
-    printf("[gc2607_isp] Starting (capture=%s output=%s)\n", capture_dev, output_dev);
+    consumer_count = 0;
+    return 0;
+}
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+/*
+ * Drain all pending inotify events and update consumer_count.
+ * Call this periodically (it is non-blocking).
+ */
+static void drain_inotify(void)
+{
+    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
 
-    /* Find sensor subdevice for exposure/gain control */
-    char subdev_path[64] = {0};
-    int has_subdev = (find_sensor_subdev(subdev_path, sizeof(subdev_path)) == 0);
-    if (has_subdev)
-        printf("[gc2607_isp] Sensor subdev: %s\n", subdev_path);
-    else
-        printf("[gc2607_isp] Warning: no sensor subdev found (no AE control)\n");
+    for (;;) {
+        ssize_t len = read(inotify_fd, buf, sizeof(buf));
+        if (len <= 0)
+            break;
 
-    /* Set initial exposure/gain */
-    int cur_exposure = 600;
-    int cur_gain = 4;
+        const struct inotify_event *ev;
+        for (char *ptr = buf; ptr < buf + len;
+             ptr += sizeof(struct inotify_event) + ev->len) {
+            ev = (const struct inotify_event *)ptr;
+
+            if (ev->mask & IN_OPEN)
+                consumer_count++;
+            if (ev->mask & (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE)) {
+                consumer_count--;
+                if (consumer_count < 0)
+                    consumer_count = 0;
+            }
+        }
+    }
+}
+
+static void cleanup_inotify(void)
+{
+    if (inotify_wd >= 0) {
+        inotify_rm_watch(inotify_fd, inotify_wd);
+        inotify_wd = -1;
+    }
+    if (inotify_fd >= 0) {
+        close(inotify_fd);
+        inotify_fd = -1;
+    }
+}
+
+/*
+ * Run the streaming loop: capture frames from the sensor, process them
+ * through the ISP pipeline, and write to the output device.
+ *
+ * Exits when: running becomes 0 (signal), or no consumers remain for
+ * several consecutive poll intervals.
+ *
+ * Returns: 0 on clean consumer-loss exit, -1 on error.
+ */
+static int streaming_loop(const char *capture_dev, int out_fd,
+                          const char *subdev_path, int has_subdev)
+{
+    struct buffer buffers[NUM_BUFFERS];
+    int n_buffers = 0;
+
+    /*
+     * ISP state is static so it persists across streaming sessions.
+     * Without this, each session resets exposure/gain/WB to defaults,
+     * causing overexposed frames until hardware AE reconverges (~15s).
+     */
+    static int cur_exposure = 600;
+    static int cur_gain = 4;
+    static float wb_r_gain = 1.0f;
+    static float wb_b_gain = 1.0f;
+    static float brightness = 1.0f;
+
+    /* Restore hardware exposure/gain from previous session */
     if (has_subdev)
         set_sensor_controls(subdev_path, cur_exposure, cur_gain);
 
-    /* Open devices */
-    struct buffer buffers[NUM_BUFFERS];
-    int n_buffers = 0;
     int cap_fd = open_capture(capture_dev, buffers, &n_buffers);
     if (cap_fd < 0)
-        return 1;
+        return -1;
 
-    int out_fd = open_output(output_dev);
-    if (out_fd < 0) {
-        close(cap_fd);
-        return 1;
-    }
+    printf("[gc2607_isp] Streaming started (output %dx%d YUYV, exp=%d gain=%d bright=%.2f)\n",
+           OUT_W, OUT_H, cur_exposure, cur_gain, brightness);
 
-    printf("[gc2607_isp] Streaming (output %dx%d YUYV)\n", OUT_W, OUT_H);
-
-    /* ISP state */
-    float wb_r_gain = 1.0f;
-    float wb_b_gain = 1.0f;
-    float brightness = 1.0f;
     int frame_count = 0;
+    int no_consumer_count = 0;
 
-    struct timespec last_ae_time;
+    struct timespec last_ae_time, last_consumer_check;
     clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
+    clock_gettime(CLOCK_MONOTONIC, &last_consumer_check);
 
     while (running) {
         /* Dequeue a capture buffer */
@@ -479,7 +585,10 @@ int main(int argc, char *argv[])
         float cur_brightness_8bit = g_mean * brightness / MAX_SIGNAL * 255.0f;
         if (cur_brightness_8bit > 1.0f) {
             float ae_ratio = AE_TARGET / cur_brightness_8bit;
-            brightness = AE_SMOOTHING * brightness + (1.0f - AE_SMOOTHING) * (brightness * ae_ratio);
+            brightness = (
+                AE_SMOOTHING * brightness
+                + (1.0f - AE_SMOOTHING) * (brightness * ae_ratio)
+            );
             if (brightness < BRIGHTNESS_MIN) brightness = BRIGHTNESS_MIN;
             if (brightness > BRIGHTNESS_MAX) brightness = BRIGHTNESS_MAX;
         }
@@ -487,8 +596,10 @@ int main(int argc, char *argv[])
         /* Hardware AE: adjust sensor exposure/gain when software gain is railing */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (now.tv_sec - last_ae_time.tv_sec) +
-                         (now.tv_nsec - last_ae_time.tv_nsec) / 1e9;
+        double elapsed = (
+            (now.tv_sec - last_ae_time.tv_sec)
+            + (now.tv_nsec - last_ae_time.tv_nsec) / 1e9
+        );
 
         if (has_subdev && elapsed >= AE_INTERVAL_S) {
             if (brightness > 2.5f) {
@@ -496,7 +607,7 @@ int main(int argc, char *argv[])
                     cur_exposure = (int)(cur_exposure * 1.5);
                     if (cur_exposure > EXPOSURE_MAX) cur_exposure = EXPOSURE_MAX;
                 } else if (cur_gain < GAIN_MAX) {
-                    /* Exposure maxed — step gain up by 2 for faster convergence */
+                    /* Exposure maxed: step gain up by 2 for faster convergence */
                     cur_gain += 2;
                     if (cur_gain > GAIN_MAX) cur_gain = GAIN_MAX;
                 }
@@ -528,22 +639,139 @@ int main(int argc, char *argv[])
 
         frame_count++;
         if (frame_count % 150 == 0) {
-            printf("[gc2607_isp] %d frames | WB: R=%.2f B=%.2f | bright=%.2f | exp=%d gain=%d\n",
-                   frame_count, wb_r_gain, wb_b_gain, brightness, cur_exposure, cur_gain);
+            printf("[gc2607_isp] %d frames | WB: R=%.2f B=%.2f | bright=%.2f | exp=%d gain=%d | means: R=%.1f G=%.1f B=%.1f\n",
+                   frame_count, wb_r_gain, wb_b_gain, brightness, cur_exposure, cur_gain,
+                   r_mean, g_mean, b_mean);
+        }
+
+        /*
+         * Periodically check if consumers are still attached.
+         * If no consumers for 5 consecutive checks (~10s), stop streaming
+         * to release the hardware and save power.
+         */
+        double since_check = (
+            (now.tv_sec - last_consumer_check.tv_sec)
+            + (now.tv_nsec - last_consumer_check.tv_nsec) / 1e9
+        );
+        if (since_check >= CONSUMER_CHECK_INTERVAL_S) {
+            last_consumer_check = now;
+            drain_inotify();
+            if (consumer_count <= 0) {
+                no_consumer_count++;
+                if (no_consumer_count >= 5) {
+                    printf("[gc2607_isp] No consumers detected, stopping stream (%d frames)\n",
+                           frame_count);
+                    close_capture(cap_fd, buffers, n_buffers);
+                    return 0;
+                }
+            } else {
+                no_consumer_count = 0;
+            }
         }
     }
 
     printf("[gc2607_isp] Shutting down (%d frames total)\n", frame_count);
+    close_capture(cap_fd, buffers, n_buffers);
+    return running ? -1 : 0;
+}
 
-    /* Stop streaming */
-    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    xioctl(cap_fd, VIDIOC_STREAMOFF, &type);
+int main(int argc, char *argv[])
+{
+    const char *capture_dev = argc > 1 ? argv[1] : "/dev/video1";
+    const char *output_dev  = argc > 2 ? argv[2] : "/dev/video50";
 
-    /* Unmap buffers */
-    for (int i = 0; i < n_buffers; i++)
-        munmap(buffers[i].start, buffers[i].length);
+    /* Line-buffered stdout so logs appear in journald */
+    setvbuf(stdout, NULL, _IOLBF, 0);
 
-    close(cap_fd);
+    printf("[gc2607_isp] Starting with lazy activation (capture=%s output=%s)\n",
+           capture_dev, output_dev);
+
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    /* Find sensor subdevice for exposure/gain control */
+    char subdev_path[64] = {0};
+    int has_subdev = (find_sensor_subdev(subdev_path, sizeof(subdev_path)) == 0);
+    if (has_subdev)
+        printf("[gc2607_isp] Sensor subdev: %s\n", subdev_path);
+    else
+        printf("[gc2607_isp] Warning: no sensor subdev found (no AE control)\n");
+
+    /* Open output device (kept open for the lifetime of the process) */
+    int out_fd = open_output(output_dev);
+    if (out_fd < 0)
+        return 1;
+
+    /* Set up inotify AFTER opening out_fd so our own open isn't counted */
+    if (init_inotify(output_dev) < 0) {
+        fprintf(stderr, "[gc2607_isp] Failed to set up inotify, exiting\n");
+        close(out_fd);
+        return 1;
+    }
+    printf("[gc2607_isp] Consumer detection via inotify on %s\n", output_dev);
+
+    /*
+     * Main idle/stream loop:
+     *   - While idle: write a black standby frame periodically so that
+     *     PipeWire/wireplumber sees the device as active and camera apps
+     *     can discover it. Use select() on inotify_fd to wake instantly
+     *     when a consumer opens the device.
+     *   - When a consumer opens /dev/video50: start capturing from the
+     *     sensor, process frames through the ISP, and write to output.
+     *   - When all consumers close: stop streaming and return to idle.
+     */
+
+    /* Prepare a black standby frame (Y=16, U=128, V=128 = black in YUYV) */
+    memset(yuyv_buf, 0, sizeof(yuyv_buf));
+    for (size_t i = 0; i < sizeof(yuyv_buf); i += 4) {
+        yuyv_buf[i]     = 16;   /* Y0 */
+        yuyv_buf[i + 1] = 128;  /* U  */
+        yuyv_buf[i + 2] = 16;   /* Y1 */
+        yuyv_buf[i + 3] = 128;  /* V  */
+    }
+    /* Write initial standby frame so wireplumber can probe successfully */
+    write(out_fd, yuyv_buf, sizeof(yuyv_buf));
+
+    printf("[gc2607_isp] Idle, waiting for consumers on %s...\n", output_dev);
+
+    while (running) {
+        /*
+         * Wait for inotify events (consumer open) with a timeout.
+         * The timeout ensures we periodically write standby frames
+         * to keep v4l2loopback alive for PipeWire device discovery.
+         */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(inotify_fd, &rfds);
+        struct timeval tv;
+        tv.tv_sec = STANDBY_INTERVAL_MS / 1000;
+        tv.tv_usec = (STANDBY_INTERVAL_MS % 1000) * 1000;
+
+        int sel = select(inotify_fd + 1, &rfds, NULL, NULL, &tv);
+
+        if (sel > 0)
+            drain_inotify();
+
+        if (consumer_count > 0) {
+            printf("[gc2607_isp] %d consumer(s) detected, starting stream...\n",
+                   consumer_count);
+            int ret = streaming_loop(capture_dev, out_fd,
+                                     subdev_path, has_subdev);
+            if (ret < 0 && running) {
+                printf("[gc2607_isp] Streaming error, retrying in 2s...\n");
+                sleep(2);
+            }
+            if (running)
+                printf("[gc2607_isp] Idle, waiting for consumers on %s...\n",
+                       output_dev);
+        } else {
+            /* Write standby frame to keep v4l2loopback alive */
+            write(out_fd, yuyv_buf, sizeof(yuyv_buf));
+        }
+    }
+
+    printf("[gc2607_isp] Exiting\n");
+    cleanup_inotify();
     close(out_fd);
 
     return 0;
