@@ -203,6 +203,7 @@ Common issues:
 # Stop the service
 sudo systemctl disable --now gc2607-camera.service
 sudo rm -f /etc/systemd/system/gc2607-camera.service
+sudo rm -f /usr/lib/systemd/system-sleep/gc2607
 sudo rm -rf /opt/gc2607
 sudo rm -f /etc/udev/rules.d/99-gc2607-camera.rules
 rm -f ~/.config/wireplumber/wireplumber.conf.d/50-hide-ipu6-raw.conf
