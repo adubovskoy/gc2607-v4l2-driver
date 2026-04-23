@@ -112,6 +112,13 @@ monitor.libcamera.rules = [
 EOF
 chown -R "${USER}:${USER}" "${USER_HOME}/.config/wireplumber"
 
+# Install systemd-sleep hook so the service restarts after resume
+# (Conflicts=sleep.target stops it on suspend but systemd won't restart
+# it by itself on resume)
+echo "Installing systemd-sleep resume hook..."
+install -m 0755 "${SCRIPT_DIR}/gc2607-sleep-hook.sh" \
+    /usr/lib/systemd/system-sleep/gc2607
+
 # Install systemd service
 echo "Installing systemd service..."
 cat > /etc/systemd/system/gc2607-camera.service << SVCEOF
