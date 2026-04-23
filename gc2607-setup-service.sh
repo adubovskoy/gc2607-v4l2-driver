@@ -72,11 +72,34 @@ echo "Installing wireplumber config..."
 WPDIR="${USER_HOME}/.config/wireplumber/wireplumber.conf.d"
 mkdir -p "$WPDIR"
 cat > "$WPDIR/50-hide-ipu6-raw.conf" << 'EOF'
+# Hide the raw v4l2 IPU6 device nodes so camera apps use the processed
+# /dev/video50 virtual camera (served by gc2607_isp) instead of the
+# raw 10-bit Bayer output.
 monitor.v4l2.rules = [
   {
     matches = [
       {
         device.name = "~v4l2_device.pci-*"
+      }
+    ]
+    actions = {
+      update-props = {
+        device.disabled = true
+      }
+    }
+  }
+]
+
+# Also hide the libcamera-backed GC2607 (IPU6 registers the sensor as
+# "libcamera_device.version"). libcamera exposes the sensor with its own
+# minimal pipeline that bypasses gc2607_isp — without this, some apps
+# see two "GC2607 Camera" entries and pick the broken raw-Bayer one.
+# USB webcams normally take the uvcvideo path and are unaffected.
+monitor.libcamera.rules = [
+  {
+    matches = [
+      {
+        device.name = "libcamera_device.version"
       }
     ]
     actions = {
