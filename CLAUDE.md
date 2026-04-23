@@ -121,9 +121,9 @@ The entire driver is in `gc2607.c`. Key sections by function:
 - `gc2607-test.sh` — Capture a single frame and convert to PNG
 - `view_raw_wb.py` — Convert raw capture to PNG with gray world white balance
 
-## After Fedora Kernel Updates
+## After Kernel Updates (Arch Linux)
 
-DKMS automatically rebuilds both modules (gc2607 + patched ipu-bridge) on kernel updates. No manual steps needed — just reboot into the new kernel.
+DKMS automatically rebuilds both modules (gc2607 + patched ipu-bridge) on kernel updates. No manual steps needed — just reboot into the new kernel after `pacman -Syu`.
 
 To check DKMS status: `dkms status`
 
@@ -142,7 +142,7 @@ To set up DKMS (one-time): `sudo ./dkms-setup.sh`
 - **Green tint in GStreamer**: GStreamer's `bayer2rgb` outputs green at 1.7x red/blue from 10-bit Bayer. Use `gc2607_isp` instead, which does proper demosaicing with per-frame WB
 - **Media link must be enabled**: `media-ctl -l` command required before streaming (done by `gc2607-service.sh`)
 - **CSI2 format must be set**: CSI2 pads default to 4096x3072; must set to 1920x1080 or streaming fails with broken pipe
-- **Module xz compression**: Fedora's kernel module loader expects `xz --check=crc32`. Default xz uses CRC64 which causes `decompression failed with status 6`
+- **Module compression (Arch)**: Arch uses zstd for kernel modules (`ipu-bridge.ko.zst`). `gc2607-install.sh` compresses the built module with `zstd` before installing. On distros that still use xz, compress with `xz --check=crc32` (default CRC64 fails to load with `decompression failed with status 6`).
 - **Home directory permissions**: systemd services may not access home dirs (mode 700). Scripts are installed to `/opt/gc2607/`
 - **PipeWire/wireplumber**: Must restart wireplumber after v4l2loopback loads so camera apps see the device. Must also hide raw IPU6 nodes via wireplumber rule or apps pick wrong device
 - **Python path** (legacy fallback only): `gc2607-setup-service.sh` finds a Python with `numpy` + `pyfakewebcam` at install time and saves to `/opt/gc2607/.python-path`. Only used if `gc2607_isp` binary is not available
