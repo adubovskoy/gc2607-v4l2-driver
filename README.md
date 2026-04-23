@@ -1,402 +1,245 @@
-# GC2607 Camera Driver for Linux
+# GC2607 Camera Driver for Arch Linux
 
-A fully functional Linux V4L2 driver for the GalaxyCore GC2607 camera sensor, integrated with Intel IPU6 on x86_64 systems.
+V4L2 driver + userspace ISP + systemd service that makes the **GalaxyCore
+GC2607** sensor behind Intel IPU6 work as a regular webcam on Arch Linux
+(and Arch-based distros like EndeavourOS, Manjaro, CachyOS).
 
-## Overview
+After install the camera shows up as **"GC2607 Camera"** in any app that
+uses PipeWire or plain V4L2 — GNOME Camera, Chromium, Firefox, OBS Studio,
+Zoom, Slack, Google Meet, Telegram, etc.
 
-This driver successfully ports the GC2607 sensor from embedded platforms to mainline Linux, enabling camera functionality on laptops with Intel IPU6 that use this sensor.
+> This is the Arch-Linux fork of [abbood/gc2607-v4l2-driver](https://github.com/abbood/gc2607-v4l2-driver)
+> plus [PR #4](https://github.com/abbood/gc2607-v4l2-driver/pull/4) (DKMS
+> + C ISP + systemd service). The upstream install scripts target Fedora
+> (dnf, `/usr/src/kernels/<ver>`, xz-compressed modules); this fork ports
+> them to pacman, `/lib/modules/<ver>/build`, and zstd.
 
-**Status:** ✅ **FULLY FUNCTIONAL** - Camera working with OBS Studio and video applications!
+## Supported hardware
 
-### Supported Hardware
+| Thing | Value |
+|---|---|
+| Sensor | GalaxyCore GC2607 (chip ID 0x2607) |
+| Platform | Intel IPU6 (Meteor Lake and later) |
+| Reference laptop | Huawei MateBook Pro VGHH-XX |
+| Format | 10-bit Bayer GRBG (SGRBG10) |
+| Native resolution | 1920×1080 @ 30 fps |
+| Virtual output | YUYV 960×540 @ 30 fps on `/dev/video50` |
+| ACPI HID | `GCTI2607` |
 
-- **Sensor:** GalaxyCore GC2607
-- **Platform:** Intel IPU6 (tested on Huawei MateBook Pro VGHH-XX)
-- **Interface:** MIPI CSI-2 (2 lanes, 672 Mbps/lane)
-- **Resolution:** 1920x1080 @ 30fps
-- **Format:** 10-bit RAW Bayer (GRBG pattern)
-- **ACPI HID:** GCTI2607
+## What gets installed
 
-## Project Status
-
-- ✅ Phase 1: Skeleton driver with ACPI binding
-- ✅ Phase 2: Power management and sensor detection
-- ✅ Phase 3: Register initialization (122 registers)
-- ✅ Phase 4: V4L2 integration (async subdev, pad ops, controls)
-- ✅ Phase 5: IPU6 bridge integration
-- ✅ Phase 6: Image capture and streaming **SUCCESS!**
-- ✅ Phase 7: Exposure & gain controls **COMPLETE!**
-
-## Features
-
-✅ Full V4L2 subdev integration
-✅ Intel IPU6 media controller support
-✅ MIPI CSI-2 interface (2 lanes @ 336 MHz)
-✅ 1920x1080 @ 30fps capture
-✅ 10-bit RAW Bayer output
-✅ Power management via INT3472 PMIC
-✅ Runtime PM support
-✅ Proper reset sequencing
-✅ **Exposure control (V4L2_CID_EXPOSURE) - range 4-2002**
-✅ **Analog gain control (V4L2_CID_ANALOGUE_GAIN) - LUT index 0-16**
-✅ **Gray world white balance** during Bayer-to-RGB conversion
-✅ **OBS Studio integration with virtual RGB camera**
-✅ **Google Meet / Chrome / Chromium support (24fps I420)**
-
-## Prerequisites
-
-### Required Packages (Arch Linux)
-
-```bash
-# Core driver dependencies
-sudo pacman -S base-devel linux-headers v4l-utils media-ctl python-pillow python-numpy feh
-
-# For OBS Studio integration (optional)
-sudo pacman -S v4l2loopback-dkms gstreamer gst-plugins-base gst-plugins-good
+```
+gc2607 sensor (SGRBG10 raw 10-bit Bayer)
+  → Intel IPU6 CSI2 0
+  → Intel IPU6 ISYS Capture 0  (/dev/videoN)
+  → gc2607_isp                 (C: demosaic + auto-WB + auto-AE + sRGB gamma)
+  → v4l2loopback /dev/video50  ("GC2607 Camera", YUYV 960x540)
+  → PipeWire                   → camera apps
 ```
 
-### Modified IPU6 Bridge Module
+Two kernel modules:
 
-**Important:** This driver requires a modified `ipu_bridge` kernel module that recognizes the GC2607 sensor.
+- **`gc2607.ko`** — the sensor V4L2 subdev driver
+- **`ipu-bridge.ko`** (patched) — adds `GCTI2607` to the IPU sensor table
+  so IPU6 knows how to wire the sensor into the media pipeline
 
-#### Installation
+One userspace daemon:
 
-```bash
-# 1. Run the setup script to download kernel source
-./setup_ipu_bridge_mod.sh
+- **`gc2607_isp`** — C program that reads Bayer from the IPU6 capture
+  node, runs gray-world white balance + auto-exposure + sRGB gamma via
+  a per-channel LUT, and writes YUYV into the v4l2loopback device
+  (~4–5 % CPU on an Intel Core Ultra, vs. ~43 % for the Python version).
 
-# 2. Compile the modified bridge module
-./compile_ipu_bridge_simple.sh
+Plus a systemd service (`gc2607-camera.service`) that wires it all up at
+boot, and a WirePlumber rule that hides the raw IPU6 sources so apps pick
+the processed virtual camera.
 
-# The script will automatically:
-# - Add GCTI2607 support to ipu-bridge.c
-# - Compile against your running kernel
-# - Install the modified module
-# - Create a backup of the original
-```
+## Install
 
-## Building the Driver
-
-```bash
-make
-```
-
-## Usage
-
-### Quick Start (After Reboot)
-
-1. **Initialize the camera** (loads modules and configures everything):
-   ```bash
-   sudo ./init_camera.sh
-   ```
-
-2. **Capture a test image**:
-   ```bash
-   ./quick_capture.sh
-   feh test.png
-   ```
-
-**Current Status**: 
-- ✅ Driver fully functional with exposure/gain controls
-- ✅ No post-processing needed - images are properly exposed natively
-
-### Manual Capture
-```bash
-# 1. Load required modules
-sudo modprobe videodev v4l2-async ipu_bridge intel-ipu6 intel-ipu6-isys
-sudo insmod gc2607.ko
-
-# 2. Configure video format and enable link
-v4l2-ctl -d /dev/video0 --set-fmt-video=width=1920,height=1080,pixelformat=BA10
-media-ctl -d /dev/media0 -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]'
-
-# 3. Capture raw image and view
-v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=myimage.raw
-./view_raw_bright.py myimage.raw 1.0
-feh test.png
-```
-
-### Automated Capture Script
-
-For convenience, you can create a script:
+### 1. Prerequisites
 
 ```bash
-#!/bin/bash
-# capture.sh - Quick capture script
-
-# Configure and capture
-v4l2-ctl -d /dev/video0 --set-fmt-video=width=1920,height=1080,pixelformat=BA10
-media-ctl -d /dev/media0 -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]'
-v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=capture_$(date +%s).raw
-
-# Convert last captured image
-LATEST=$(ls -t capture_*.raw | head -1)
-./view_raw_bright.py "$LATEST" 5.0
-feh "${LATEST%.raw}.png"
+sudo pacman -S --needed base-devel linux-headers dkms zstd curl \
+    v4l-utils v4l2loopback-dkms \
+    gstreamer gst-plugins-base gst-plugins-good
 ```
 
-### Using with OBS Studio and Video Applications
-
-The camera outputs raw Bayer format which most applications can't handle directly. Use the virtual RGB camera:
+### 2. Clone and build
 
 ```bash
-# 1. Initialize the camera (only needed once per boot)
-sudo ./init_camera.sh
-
-# 2. Create virtual RGB camera (leave running in background)
-./create_virtual_camera.sh
+git clone https://github.com/adubovskoy/gc2607-v4l2-driver.git
+cd gc2607-v4l2-driver
+make              # builds gc2607.ko and gc2607_isp
 ```
 
-Now in OBS Studio:
-1. Add Source → Video Capture Device (V4L2)
-2. Select device: **"GC2607 RGB"** from the dropdown
-3. The camera will appear with proper RGB colors and correct orientation
+### 3. Install the kernel modules
 
-**Note:** The `create_virtual_camera.sh` script must keep running while using the camera.
+You have two options. Pick **one**.
 
-### Using with Google Meet and Chrome/Chromium
-
-**Important:** Chrome/Chromium's PipeWire camera support blocks v4l2loopback virtual cameras. You need to disable it:
-
-#### One-time Setup for Chrome/Chromium:
-
-1. Open Chrome/Chromium and navigate to: `chrome://flags`
-2. Search for: **"pipewire"**
-3. Find: **"PipeWire Camera support"**
-4. Set to: **Disabled**
-5. Click **"Relaunch"**
-
-#### Using the Camera:
+#### Option A: DKMS (recommended — survives kernel upgrades)
 
 ```bash
-# Option 1: Use create_virtual_camera.sh (works for both OBS and Meet)
-./create_virtual_camera.sh
-
-# Option 2: Use reload_for_chrome.sh (optimized for Chrome with I420 format)
-./reload_for_chrome.sh
+sudo ./dkms-setup.sh
 ```
 
-Then in Google Meet:
-1. Join a meeting
-2. Click Settings (gear icon) → Video
-3. Select: **"GC2607 RGB Camera"** from the dropdown
+This registers two DKMS packages (`gc2607` and `ipu-bridge-gc2607`). On
+every kernel upgrade pacman runs the DKMS hooks and both modules rebuild
+automatically — no manual step after `pacman -Syu`.
 
-**Note:** Your external USB cameras (like Logitech) will still work perfectly with PipeWire disabled. Both cameras will appear in the list.
-
-### Adjusting Exposure and Gain
-
-The camera uses a gain LUT (lookup table) with 17 entries (0-16), not raw gain values.
+Verify:
 
 ```bash
-# List available controls
-v4l2-ctl -d /dev/v4l-subdev6 --list-ctrls
-
-# Adjust exposure (range: 4-2002)
-v4l2-ctl -d /dev/v4l-subdev6 --set-ctrl exposure=2002
-
-# Adjust gain (range: 0-16, LUT index)
-# 0 = 1.0x gain (lowest noise)
-# 4 = 2.0x gain
-# 8 = 4.0x gain
-# 16 = 15.8x gain (max)
-v4l2-ctl -d /dev/v4l-subdev6 --set-ctrl analogue_gain=16
-
-# Optimal defaults for indoor lighting (set automatically by scripts)
-v4l2-ctl -d /dev/v4l-subdev6 --set-ctrl exposure=2002,analogue_gain=16
+dkms status
+# gc2607/1.0, 6.19.13-arch1-1, x86_64: installed
+# ipu-bridge-gc2607/1.0, 6.19.13-arch1-1, x86_64: installed
 ```
 
-### White Balance
-
-All camera scripts automatically apply **gray world white balance** during Bayer-to-RGB conversion using GStreamer's `frei0r-filter-coloradj-rgb`:
-
-- **Red gain:** 1.034
-- **Green gain:** 1.000 (reference)
-- **Blue gain:** 1.246
-
-These values are calibrated for natural color reproduction. To recalibrate for your lighting conditions:
+#### Option B: manual install (no kernel-update rebuild)
 
 ```bash
-# Capture a test frame
-v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=wb_test.raw
-
-# Calculate optimal white balance gains
-./calculate_wb_gains.py wb_test.raw
-
-# Use the calculated gains with the WB script
-./create_virtual_camera_wb.sh <R_GAIN> <G_GAIN> <B_GAIN>
+sudo ./gc2607-install.sh
 ```
+
+This builds both modules once for the running kernel and installs them
+under `/lib/modules/<ver>/`. After every `pacman -Syu` that bumps the
+kernel you'll have to re-run it. Backups of the original `ipu-bridge`
+land in `~/gc2607-backups/`.
+
+To roll back:
+
+```bash
+sudo ./gc2607-install.sh revert
+```
+
+### 4. Install the systemd service (auto-start virtual camera)
+
+```bash
+sudo ./gc2607-setup-service.sh
+```
+
+This:
+
+- Copies `gc2607_isp` and the service scripts to `/opt/gc2607/`
+- Installs `gc2607-camera.service` and enables it
+- Drops a WirePlumber rule at `~/.config/wireplumber/wireplumber.conf.d/50-hide-ipu6-raw.conf`
+  that disables the raw v4l2 IPU6 device nodes and the libcamera-backed
+  GC2607 so camera apps see only the processed `/dev/video50`
+
+### 5. Reboot
+
+```bash
+sudo reboot
+```
+
+After reboot:
+
+```bash
+# Service should be running
+systemctl status gc2607-camera.service
+
+# /dev/video50 should exist, labelled "GC2607 Camera"
+v4l2-ctl --list-devices
+
+# One quick test capture
+ffmpeg -f v4l2 -i /dev/video50 -frames:v 1 -y /tmp/test.jpg
+```
+
+Open any camera app and pick **GC2607 Camera**.
+
+## Usage notes
+
+- The service uses **lazy activation** — `gc2607_isp` only pulls frames
+  from the IPU6 when an app actually opens `/dev/video50`. Idle cost is
+  essentially zero.
+- The pipeline is 180° rotated in software (free, done during the YUYV
+  write). If your mount is upside-down, remove the rotation in
+  `gc2607_isp.c`.
+- External USB webcams are **not** affected by the WirePlumber hide rule
+  (it matches only `v4l2_device.pci-*` and the one specific IPU6
+  libcamera device). Both will show up side by side.
+- White balance is gray-world + per-frame, with no manual offsets. If
+  the scene is heavily monochromatic the balance may drift; this is
+  normal for gray-world.
 
 ## Troubleshooting
 
-### Image is too dark or too bright
-Adjust the exposure and gain controls:
 ```bash
-# Increase brightness (max values)
-v4l2-ctl -d /dev/v4l-subdev6 --set-ctrl exposure=2002,analogue_gain=16
+# Service / pipeline
+journalctl -u gc2607-camera.service -n 50
 
-# Decrease brightness (for bright conditions)
-v4l2-ctl -d /dev/v4l-subdev6 --set-ctrl exposure=1000,analogue_gain=8
+# Was the sensor probed?
+dmesg | grep -iE 'gc2607|GCTI2607'
 
-# For raw captures, use white balance script:
-./view_raw_wb.py capture.raw 5.0
+# Is the bridge patched?
+strings "$(modinfo -n ipu_bridge)" | grep GCTI2607
 
-# Or use brightness multiplier without white balance:
-./view_raw_bright.py capture.raw 8.0  # Try values between 3.0 and 10.0
+# Does PipeWire see the processed camera?
+wpctl status | grep -iA1 video
 ```
 
-### Image is all black
-Check if your laptop has a physical camera privacy slider/cover. Many laptops include a hardware privacy mechanism.
+Common issues:
 
-### "Link has been severed" error
-The media link isn't enabled. Run:
+- **"GC2607 Camera" missing after reboot** — `systemctl status
+  gc2607-camera.service`; if `intel_ipu6` failed to probe, the service
+  can't set up the CSI2 pipeline. Full log lives in journalctl.
+- **Camera appears but shows green tint / garbled colours** — your app
+  likely picked the raw libcamera source instead of `/dev/video50`.
+  Re-run `sudo ./gc2607-setup-service.sh` and restart the app; the
+  WirePlumber rule should hide the libcamera entry.
+- **Kernel just upgraded, module missing** — if you used manual install
+  (Option B), re-run `sudo ./gc2607-install.sh`. If you used DKMS,
+  check `dkms status` — rebuilds can fail e.g. when `linux-headers` for
+  the new kernel isn't installed yet.
+- **DKMS build fails on `ipu-bridge-gc2607`** — the pre-build script
+  fetches matching `ipu-bridge.c` from kernel.org. Make sure the machine
+  has internet access when pacman runs the DKMS hook.
+- **Suspend hangs / `-EBUSY` on resume** — you're probably on an old
+  build of `gc2607.ko` without `SET_SYSTEM_SLEEP_PM_OPS`. Rebuild from
+  this branch (or `dkms install --force`).
+
+## Uninstall
+
 ```bash
-media-ctl -d /dev/media0 -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]'
+# Stop the service
+sudo systemctl disable --now gc2607-camera.service
+sudo rm -f /etc/systemd/system/gc2607-camera.service
+sudo rm -rf /opt/gc2607
+sudo rm -f /etc/udev/rules.d/99-gc2607-camera.rules
+rm -f ~/.config/wireplumber/wireplumber.conf.d/50-hide-ipu6-raw.conf
+
+# If installed via DKMS
+sudo dkms uninstall gc2607/1.0 --all
+sudo dkms remove    gc2607/1.0 --all
+sudo dkms uninstall ipu-bridge-gc2607/1.0 --all
+sudo dkms remove    ipu-bridge-gc2607/1.0 --all
+sudo rm -f /etc/depmod.d/ipu-bridge-gc2607.conf
+sudo depmod -a
+
+# If installed manually
+sudo ./gc2607-install.sh revert
 ```
 
-### "Format mismatch" error
-Ensure you're using the BA10 pixel format (GRBG Bayer):
-```bash
-v4l2-ctl -d /dev/video0 --set-fmt-video=width=1920,height=1080,pixelformat=BA10
-```
+## Differences from upstream
 
-### Sensor not detected
-1. Check that ipu_bridge recognizes GCTI2607:
-   ```bash
-   sudo dmesg | grep -i "GCTI2607\|gc2607"
-   ```
-2. Verify the modified ipu_bridge is loaded:
-   ```bash
-   modinfo ipu_bridge
-   strings /lib/modules/$(uname -r)/kernel/drivers/media/pci/intel/ipu-bridge.ko.zst | grep GCTI2607
-   ```
+- `gc2607-install.sh` / `dkms-setup.sh` use **pacman + zstd +
+  `/lib/modules/<ver>/build`** instead of dnf + xz + `/usr/src/kernels`.
+- `gc2607-restart-wireplumber.sh` picks the desktop user by scanning
+  `/run/user/` for **uid >= 1000** instead of relying on `logname` /
+  `who`, so it no longer tries to `su -` into the display-manager's
+  greeter account (e.g. `plasmalogin` on KDE) which has a nologin shell.
+- The WirePlumber rule also disables the **libcamera-backed GC2607**
+  (`libcamera_device.version`), not just the PCI v4l2 nodes — otherwise
+  some apps pick the libcamera source and show raw Bayer.
+- Build artifacts (`*.ko`, `*.o`, `.*.cmd`, `Module.symvers`, `gc2607_isp`)
+  are gitignored rather than tracked.
 
-### Camera not appearing in Google Meet/Chrome
+## Credit
 
-**Cause:** Chrome's PipeWire camera support blocks v4l2loopback virtual cameras.
-
-**Solution:**
-1. Go to `chrome://flags` in Chrome/Chromium
-2. Search for "pipewire"
-3. Disable "PipeWire Camera support"
-4. Restart the browser
-5. Run `./reload_for_chrome.sh` to restart the camera pipeline
-6. Refresh Google Meet
-
-The camera should now appear as "GC2607 RGB Camera" in the device list.
-
-## Architecture
-
-### Media Pipeline
-
-```
-┌─────────────┐      ┌──────────────────┐      ┌─────────────────────┐
-│  gc2607     │      │ Intel IPU6 CSI2 0│      │ Intel IPU6 ISYS     │
-│  5-0037     │─────▶│  (MIPI Receiver) │─────▶│ Capture 0           │
-│ (Sensor)    │      │  /dev/v4l-subdev0│      │ /dev/video0         │
-└─────────────┘      └──────────────────┘      └─────────────────────┘
- /dev/v4l-subdev6
-   SGRBG10_1X10           SGRBG10_1X10              BA10 (GRBG)
-   1920x1080              1920x1080                 1920x1080
-```
-
-### Key Components
-
-- **gc2607.c** - Main driver (V4L2 subdev, power management, register initialization)
-- **ipu-bridge.c** - Modified to recognize GCTI2607 sensor
-- **view_raw_bright.py** - RAW Bayer to PNG converter with brightness boost
-- **view_raw_wb.py** - RAW Bayer to PNG converter with gray world white balance
-- **calculate_wb_gains.py** - Calculate optimal white balance gains from raw capture
-- **create_virtual_camera.sh** - Create virtual RGB camera with white balance (OBS/YUY2)
-- **create_virtual_camera_wb.sh** - Parameterized white balance version
-- **reload_for_chrome.sh** - Create virtual RGB camera for Chrome/Meet (I420, 24fps)
-- **compile_ipu_bridge_simple.sh** - Builds modified ipu_bridge module
-
-## Technical Details
-
-### Sensor Specifications
-- **Resolution:** 1920x1080
-- **Frame Rate:** 30 fps
-- **Bit Depth:** 10-bit RAW
-- **Bayer Pattern:** GRBG (MEDIA_BUS_FMT_SGRBG10_1X10)
-- **I2C Address:** 0x37
-- **Chip ID:** 0x2607
-
-### MIPI Configuration
-- **Lanes:** 2
-- **Link Frequency:** 336 MHz
-- **Data Rate:** 672 Mbps/lane
-- **Pixel Rate:** 134.4 MHz
-
-### Power Management
-- **PMIC:** INT3472:01 (intel_skl_int3472_discrete)
-- **Clock:** 19.2 MHz from platform
-- **Regulators:** avdd (INT3472:01), dovdd (dummy), dvdd (dummy)
-- **Reset GPIO:** Provided by INT3472 PMIC
-- **Reset Sequence:** HIGH (20ms) → LOW (20ms) → HIGH (10ms)
-
-## Test Scripts
-
-- `test_phase4.sh` - Verify V4L2 integration
-- `test_camera_streaming.sh` - Check IPU6 integration
-- `investigate_ipu_bridge.sh` - Analyze bridge sensor support
-- `QUICK_TEST.sh` - Quick functionality test
-- `view_raw.py` - Basic RAW converter
-- `view_raw_bright.py` - RAW converter with brightness boost
-
-## Future Enhancements
-
-The driver is fully functional and ready for production use. Potential improvements include:
-
-**High Priority:**
-- Auto-exposure (AE) algorithm
-- Auto white balance (AWB)
-- Improved demosaicing algorithm
-
-**Medium Priority:**
-- Multiple resolution support (720p, 480p, etc.)
-- Frame rate control (15fps, 24fps options)
-- Test pattern mode for debugging
-
-**Low Priority:**
-- Auto-focus support (if VCM present)
-- HDR support
-- Advanced ISP features
-
-## Documentation
-
-- **[CLAUDE.md](CLAUDE.md)** - Complete development guide and technical details
-- **[INT3472_INTEGRATION_ANALYSIS.md](INT3472_INTEGRATION_ANALYSIS.md)** - PMIC integration analysis
-
-## References
-
-- [V4L2 Documentation](https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/v4l2.html)
-- [Media Controller Documentation](https://www.kernel.org/doc/html/latest/userspace-api/media/mediactl/media-controller.html)
-- [Intel IPU6 Driver](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/media/pci/intel)
+- Original out-of-tree driver: [**abbood/gc2607-v4l2-driver**](https://github.com/abbood/gc2607-v4l2-driver)
+- DKMS, C ISP, systemd service, suspend support: [**farhanferoz** (PR #4)](https://github.com/abbood/gc2607-v4l2-driver/pull/4)
+- Arch Linux port: [**adubovskoy**](https://github.com/adubovskoy/gc2607-v4l2-driver)
+- Hardware identification: [yegor-alexeyev](https://github.com/yegor-alexeyev) — suggested the MateBook Pro 2024 VGHH-XX uses GC2607 in [intel/ipu6-drivers#399](https://github.com/intel/ipu6-drivers/issues/399#issuecomment-3707318638)
 
 ## License
 
-This driver is released under the GPL-2.0 license, consistent with the Linux kernel.
-
-## Contributing
-
-Contributions welcome! Areas of interest:
-- Auto-exposure/auto-gain algorithms
-- Multi-resolution support
-- Other GalaxyCore sensors (GC1029, etc.)
-- Testing on different hardware platforms
-- OBS Studio plugin for native Bayer support
-- Special thanks to [yegor-alexeyev](https://github.com/yegor-alexeyev) for suggesting that the Matebook Pro 2024 VGHH-XX has the GC2607 sensor in [this post](https://github.com/intel/ipu6-drivers/issues/399#issuecomment-3707318638)
-
-## Acknowledgments
-
-- Reference driver from Ingenic T41 platform
-- Linux kernel V4L2 subsystem documentation
-- Intel IPU6 driver developers
-
----
-
-**Status:** ✅ Production ready - Full exposure/gain control, OBS Studio & Google Meet compatible
-**Tested on:** Huawei MateBook Pro VGHH-XX
-**Kernel:** 6.17.9-arch1-1
-**Last Updated:** January 7, 2026
-**Achievement:** Successfully ported proprietary embedded camera driver to mainline Linux V4L2 with IPU6 integration, full manual controls, real-time video streaming, and WebRTC compatibility
+GPL-2.0, matching the Linux kernel.
