@@ -1,6 +1,7 @@
 #!/bin/bash
 #
-# GC2607 Camera Driver Installer for Huawei MateBook X Pro (VGHH-XX)
+# GC2607 Camera Driver Installer for Arch Linux / EndeavourOS
+# (Huawei MateBook Pro VGHH-XX with Intel IPU6 Meteor Lake)
 #
 # Installs:
 #   1. Patched ipu_bridge module (adds GCTI2607 sensor recognition)
@@ -19,12 +20,11 @@ KVER="$(uname -r)"
 KVER_SHORT="${KVER%%-*}"
 MODULES_DIR="/lib/modules/${KVER}"
 IPU_BRIDGE_DIR="${MODULES_DIR}/kernel/drivers/media/pci/intel"
-IPU_BRIDGE_FILE="${IPU_BRIDGE_DIR}/ipu-bridge.ko.xz"
+IPU_BRIDGE_FILE="${IPU_BRIDGE_DIR}/ipu-bridge.ko.zst"
 EXTRA_DIR="${MODULES_DIR}/extra"
-GC2607_SYSTEM="${EXTRA_DIR}/gc2607.ko"
+GC2607_SYSTEM="${EXTRA_DIR}/gc2607.ko.zst"
 MODULES_LOAD_CONF="/etc/modules-load.d/gc2607.conf"
 
-# Resolve paths relative to this script's location and the invoking user
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRIVER_REPO="${SCRIPT_DIR}"
 USER_HOME="$(getent passwd "${SUDO_USER:-$USER}" | cut -d: -f6)"
@@ -57,8 +57,8 @@ preflight() {
         die "This script must be run as root (sudo)."
     fi
 
-    if [ ! -d "/usr/src/kernels/${KVER}" ]; then
-        die "Kernel headers not found for ${KVER}. Install with: dnf install kernel-devel-${KVER}"
+    if [ ! -d "/lib/modules/${KVER}/build" ]; then
+        die "Kernel headers not found for ${KVER}. Install with: pacman -S linux-headers"
     fi
 
     if [ ! -f "${IPU_BRIDGE_FILE}" ]; then
@@ -69,9 +69,9 @@ preflight() {
         die "gc2607.c not found in ${DRIVER_REPO}. Run this script from the gc2607-v4l2-driver directory."
     fi
 
-    for cmd in make gcc xz depmod curl; do
+    for cmd in make gcc zstd depmod curl tar xz; do
         if ! command -v "$cmd" &>/dev/null; then
-            die "Required command '${cmd}' not found."
+            die "Required command '${cmd}' not found. Install with: pacman -S base-devel zstd"
         fi
     done
 
@@ -86,15 +86,15 @@ revert() {
     info "Reverting gc2607 camera driver installation..."
 
     local latest_backup
-    latest_backup="$(ls -t "${BACKUP_DIR}"/ipu-bridge.ko.xz.* 2>/dev/null | head -1)" || true
+    latest_backup="$(ls -t "${BACKUP_DIR}"/ipu-bridge.ko.zst.* 2>/dev/null | head -1)" || true
 
     if [ -n "$latest_backup" ]; then
         info "Restoring ipu-bridge from: ${latest_backup}"
         cp "$latest_backup" "$IPU_BRIDGE_FILE"
         info "ipu-bridge restored."
     else
-        warn "No backup found. Reinstalling stock module with: dnf reinstall kernel-modules-${KVER}"
-        dnf reinstall -y "kernel-modules-${KVER}" || die "Failed to reinstall kernel-modules."
+        warn "No backup found. Reinstalling stock module with: pacman -S linux"
+        pacman -S --noconfirm linux || die "Failed to reinstall linux package."
     fi
 
     if [ -f "$GC2607_SYSTEM" ]; then
@@ -193,21 +193,20 @@ install_modules() {
 
     # Back up original ipu-bridge
     mkdir -p "$BACKUP_DIR"
-    cp "$IPU_BRIDGE_FILE" "${BACKUP_DIR}/ipu-bridge.ko.xz.${timestamp}"
-    info "Original ipu-bridge backed up to: ${BACKUP_DIR}/ipu-bridge.ko.xz.${timestamp}"
+    cp "$IPU_BRIDGE_FILE" "${BACKUP_DIR}/ipu-bridge.ko.zst.${timestamp}"
+    info "Original ipu-bridge backed up to: ${BACKUP_DIR}/ipu-bridge.ko.zst.${timestamp}"
 
-    # Compress and install patched ipu-bridge
-    # Must use --check=crc32 to match Fedora's kernel module loader expectation
-    xz --check=crc32 -f -k "${build_path}/ipu-bridge.ko"
-    cp "${build_path}/ipu-bridge.ko.xz" "$IPU_BRIDGE_FILE"
-    info "Patched ipu-bridge.ko.xz installed to ${IPU_BRIDGE_FILE}"
+    # Compress and install patched ipu-bridge using zstd (Arch's default)
+    zstd -f -q "${build_path}/ipu-bridge.ko" -o "${build_path}/ipu-bridge.ko.zst"
+    cp "${build_path}/ipu-bridge.ko.zst" "$IPU_BRIDGE_FILE"
+    info "Patched ipu-bridge.ko.zst installed to ${IPU_BRIDGE_FILE}"
 
-    # Install gc2607
+    # Install gc2607 (compress with zstd to match Arch convention)
     mkdir -p "$EXTRA_DIR"
-    cp "${DRIVER_REPO}/gc2607.ko" "$GC2607_SYSTEM"
-    info "gc2607.ko installed to ${GC2607_SYSTEM}"
+    zstd -f -q "${DRIVER_REPO}/gc2607.ko" -o "${EXTRA_DIR}/gc2607.ko.zst"
+    info "gc2607.ko.zst installed to ${GC2607_SYSTEM}"
 
-    # Auto-load at boot
+    # Auto-load at boot (driver has an ACPI alias so this is belt-and-suspenders)
     echo "gc2607" > "$MODULES_LOAD_CONF"
     info "gc2607 set to load at boot via ${MODULES_LOAD_CONF}"
 
@@ -237,7 +236,7 @@ verify() {
         ok=false
     fi
 
-    if ls "${BACKUP_DIR}"/ipu-bridge.ko.xz.* &>/dev/null; then
+    if ls "${BACKUP_DIR}"/ipu-bridge.ko.zst.* &>/dev/null; then
         info "  Backup exists in ${BACKUP_DIR}/"
     fi
 
@@ -263,7 +262,7 @@ verify() {
 
 main() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo " GC2607 Camera Driver Installer"
+    echo " GC2607 Camera Driver Installer (Arch Linux)"
     echo " Kernel: ${KVER}"
     echo " Model:  $(cat /sys/class/dmi/id/product_name 2>/dev/null || echo unknown)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
