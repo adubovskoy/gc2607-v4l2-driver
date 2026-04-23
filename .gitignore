@@ -1,0 +1,28 @@
+# Kernel module build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.*.cmd
+Module.symvers
+modules.order
+.module-common.o
+.tmp_versions/
+*.symvers
+
+# Userspace build artifacts
+gc2607_isp
+
+# Editor/tooling
+*.backup
+*.swp
+*~
+.idea/
+.vscode/
+
+# Output captures
+*.raw
+*.png
+!reference/**/*.png
