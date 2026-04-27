@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="/opt/gc2607"
 KVER="$(uname -r)"
 
 log() { echo "[gc2607] $*"; }
@@ -77,20 +77,40 @@ if grep -q "^v4l2loopback " /proc/modules; then
     sleep 1
 fi
 
+# Prefer /dev/video50 but fall back to whatever v4l2loopback grabs if 50 is
+# already taken (e.g. by an external USB webcam that enumerated first).
 modprobe v4l2loopback \
     devices=1 \
     video_nr=50 \
     card_label="GC2607 Camera" \
     exclusive_caps=1 \
-    max_buffers=2
+    max_buffers=2 \
+    || modprobe v4l2loopback \
+        devices=1 \
+        card_label="GC2607 Camera" \
+        exclusive_caps=1 \
+        max_buffers=2
 
-log "v4l2loopback loaded on /dev/video50"
+# Discover the actual loopback device by card label — robust against
+# v4l2loopback picking a different number when /dev/video50 is busy.
+LOOP_DEV=""
+for dev in /dev/video*; do
+    drv=$(v4l2-ctl -d "$dev" --info 2>/dev/null | grep "Driver name" | awk -F': *' '{print $2}' | tr -d ' ')
+    card=$(v4l2-ctl -d "$dev" --info 2>/dev/null | grep "Card type"  | awk -F': *' '{print $2}')
+    if [ "$drv" = "v4l2loopback" ] && [ "$card" = "GC2607 Camera" ]; then
+        LOOP_DEV="$dev"
+        break
+    fi
+done
+
+[ -z "$LOOP_DEV" ] && die "v4l2loopback device for GC2607 not found after modprobe"
+log "v4l2loopback at $LOOP_DEV"
 
 # ── Start C ISP (or fallback to Python virtualcam) ─────────────────
 
-log "Starting ISP (capture=$CAPTURE_DEV output=/dev/video50)..."
+log "Starting ISP (capture=$CAPTURE_DEV output=$LOOP_DEV)..."
 if [ -x "${SCRIPT_DIR}/gc2607_isp" ]; then
-    exec "${SCRIPT_DIR}/gc2607_isp" "$CAPTURE_DEV" /dev/video50
+    exec "${SCRIPT_DIR}/gc2607_isp" "$CAPTURE_DEV" "$LOOP_DEV"
 else
     # Fallback to Python virtualcam
     log "gc2607_isp not found, falling back to Python virtualcam"
@@ -99,5 +119,5 @@ else
     else
         PYTHON="python3"
     fi
-    exec "$PYTHON" "${SCRIPT_DIR}/gc2607_virtualcam.py" "$CAPTURE_DEV" /dev/video50
+    exec "$PYTHON" "${SCRIPT_DIR}/gc2607_virtualcam.py" "$CAPTURE_DEV" "$LOOP_DEV"
 fi
