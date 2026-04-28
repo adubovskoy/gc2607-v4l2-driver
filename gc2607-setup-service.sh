@@ -126,7 +126,11 @@ cat > /etc/systemd/system/gc2607-camera.service << SVCEOF
 Description=GC2607 Camera Virtual Webcam
 After=multi-user.target graphical.target
 Wants=multi-user.target
-Conflicts=sleep.target
+# Lifecycle across suspend/resume is handled by
+# /usr/lib/systemd/system-sleep/gc2607 (pre stops, post starts).
+# Do NOT use Conflicts=sleep.target — it makes systemd refuse the
+# post-resume start with a 'destructive transaction' error while
+# systemd-suspend.service is still finishing.
 
 [Service]
 Type=simple
