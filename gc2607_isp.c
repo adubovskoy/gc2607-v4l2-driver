@@ -59,7 +59,11 @@
 
 /* Sensor hardware limits */
 #define EXPOSURE_MIN    4
-#define EXPOSURE_MAX    2002
+/* Cap exposure at ~27ms (900 sensor lines) so frame rate stays ~30fps
+ * in dim scenes. AE compensates with analogue gain (up to GAIN_MAX)
+ * once exposure hits the cap; without this cap dark scenes ramp
+ * exposure to 2002 (~62ms -> 16fps) and the stream feels laggy. */
+#define EXPOSURE_MAX    900
 #define GAIN_MIN        0
 #define GAIN_MAX        16
 
@@ -73,6 +77,16 @@
 #define CONSUMER_CHECK_INTERVAL_S  2.0
 
 static volatile sig_atomic_t running = 1;
+
+/* Sensor orientation handling: the GC2607 mount direction varies by
+ * laptop model (inverted, mirrored, or upright). rotation_mode selects
+ * how captured rows/columns map to the output:
+ *   ROT_NONE  - direct (upright, no mirror)
+ *   ROT_HFLIP - horizontal flip only (upright but mirrored)
+ *   ROT_180   - full 180 degree rotation (inverted mount)
+ * Configurable via argv[3] (see main()); defaults to ROT_HFLIP. */
+enum { ROT_NONE, ROT_HFLIP, ROT_180 };
+static int rotation_mode = ROT_HFLIP;
 
 /* inotify-based consumer tracking */
 static int inotify_fd = -1;
@@ -174,7 +188,6 @@ static inline void rgb_to_yuyv(uint8_t r0, uint8_t g0, uint8_t b0,
  *   Row 1: B G B G B G ...
  *
  * 2x2 binning: each 2x2 block -> one output pixel (R, avg(G1,G2), B).
- * 180 degree rotation: output rows/cols are reversed.
  *
  * Returns the subsampled green mean for AE.
  */
@@ -189,16 +202,18 @@ static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
     int stat_count = 0;
 
     /*
-     * Iterate output pixels in reverse for 180 degree rotation.
-     * Output row (OUT_H-1-oy) col (OUT_W-1-ox) maps to Bayer block at (oy*2, ox*2).
+     * Rotation modes (see rotation_mode):
+     *   ROT_NONE   - direct mapping (sensor mounted upright, no mirror)
+     *   ROT_HFLIP  - horizontal flip only (upright but mirrored)
+     *   ROT_180    - full 180 degree rotation (inverted mount)
      */
     for (int oy = 0; oy < OUT_H; oy++) {
         /* Bayer row pointers for this 2x2 block row */
         const uint16_t *row0 = bayer + (oy * 2) * SENSOR_W;
         const uint16_t *row1 = bayer + (oy * 2 + 1) * SENSOR_W;
 
-        /* Output row (flipped) */
-        int out_y = OUT_H - 1 - oy;
+        /* Output row: direct, or reversed for 180 degree rotation */
+        int out_y = (rotation_mode == ROT_180) ? OUT_H - 1 - oy : oy;
         uint8_t *out_row = yuyv_buf + out_y * OUT_W * 2;
 
         /* Process pairs of output pixels for YUYV packing */
@@ -234,10 +249,15 @@ static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
             uint8_t R0 = lut_r[r_0],  G0 = lut_g[gavg_0], B0 = lut_b[b_0];
             uint8_t R1 = lut_r[r_1],  G1 = lut_g[gavg_1], B1 = lut_b[b_1];
 
-            /* Write YUYV (flipped horizontally too for 180 degree rotation) */
-            int out_x = OUT_W - 2 - ox;
-            /* Swap pixel order within the pair for horizontal flip */
-            rgb_to_yuyv(R1, G1, B1, R0, G0, B0, out_row + out_x * 2);
+            /* Horizontal flip for ROT_HFLIP and ROT_180; direct for ROT_NONE */
+            int out_x;
+            if (rotation_mode == ROT_NONE) {
+                out_x = ox;
+                rgb_to_yuyv(R0, G0, B0, R1, G1, B1, out_row + out_x * 2);
+            } else {
+                out_x = OUT_W - 2 - ox;
+                rgb_to_yuyv(R1, G1, B1, R0, G0, B0, out_row + out_x * 2);
+            }
 
             /* Accumulate WB statistics (subsampled).
              * Skip pixels where ANY channel is saturated (>=1020) —
@@ -679,6 +699,23 @@ int main(int argc, char *argv[])
 {
     const char *capture_dev = argc > 1 ? argv[1] : "/dev/video1";
     const char *output_dev  = argc > 2 ? argv[2] : "/dev/video50";
+
+    /* Optional third arg: rotation mode (none|hflip|rot180) */
+    if (argc > 3) {
+        if (strcmp(argv[3], "none") == 0)
+            rotation_mode = ROT_NONE;
+        else if (strcmp(argv[3], "hflip") == 0)
+            rotation_mode = ROT_HFLIP;
+        else if (strcmp(argv[3], "rot180") == 0)
+            rotation_mode = ROT_180;
+        else
+            fprintf(stderr, "[gc2607_isp] Unknown rotation mode '%s' (use none|hflip|rot180); using hflip\n",
+                    argv[3]);
+    }
+
+    printf("[gc2607_isp] rotation mode: %s\n",
+           rotation_mode == ROT_NONE ? "none" :
+           rotation_mode == ROT_HFLIP ? "hflip" : "rot180");
 
     /* Line-buffered stdout so logs appear in journald */
     setvbuf(stdout, NULL, _IOLBF, 0);

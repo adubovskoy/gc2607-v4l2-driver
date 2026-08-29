@@ -28,7 +28,7 @@ sudo modprobe intel-ipu6-isys
 sleep 2
 
 echo "Step 2: Loading GC2607 driver..."
-cd /home/abbood/dev/camera-driver-dev/gc2607-v4l2-driver
+cd "$(dirname "$0")"
 
 # Unload if already loaded
 if lsmod | grep -q gc2607; then

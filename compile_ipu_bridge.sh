@@ -3,8 +3,8 @@
 
 set -e  # Exit on error
 
-KERNEL_VER="6.17.9-arch1-1"
-KERNEL_SRC="$HOME/kernel/dev/linux-6.17.9"
+KERNEL_VER="$(uname -r)"
+KERNEL_SRC="/lib/modules/$KERNEL_VER/build"
 MODULE_NAME="ipu-bridge"
 MODULE_PATH="drivers/media/pci/intel"
 

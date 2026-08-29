@@ -54,18 +54,36 @@ log "Sensor on $MEDIA_DEV"
 
 # ── Configure Pipeline ──────────────────────────────────────────────
 
-CAPTURE_DEV=$(media-ctl -d "$MEDIA_DEV" --print-topology 2>/dev/null \
-    | grep -A3 "Intel IPU6 ISYS Capture 0" \
-    | grep -o "/dev/video[0-9]*" | head -1) || true
+# The GC2607 sensor can be wired to any CSI2 port (varies by board —
+# e.g. CSI2 0 on some units, CSI2 4 on others). Derive the wiring from
+# the actual media topology instead of hardcoding a port.
+TOPO="$(media-ctl -d "$MEDIA_DEV" --print-topology 2>/dev/null)" || true
 
-if [ -z "$CAPTURE_DEV" ]; then
-    die "Could not find capture device"
+CSI2_PORT="$(printf '%s\n' "$TOPO" \
+    | grep '"Intel IPU6 CSI2 [0-9]":0 \[' \
+    | grep -o '"Intel IPU6 CSI2 [0-9]"' | head -1)" || true
+if [ -z "$CSI2_PORT" ]; then
+    die "Could not find CSI2 port wired to GC2607"
 fi
-log "Capture device: $CAPTURE_DEV"
+CSI2_NUM="$(printf '%s\n' "$CSI2_PORT" | grep -o 'CSI2 [0-9]' | grep -o '[0-9]' | tail -1)"
+log "Sensor wired to $CSI2_PORT"
 
-media-ctl -d "$MEDIA_DEV" -V '"Intel IPU6 CSI2 0":0 [fmt:SGRBG10_1X10/1920x1080]'
-media-ctl -d "$MEDIA_DEV" -V '"Intel IPU6 CSI2 0":1 [fmt:SGRBG10_1X10/1920x1080]'
-media-ctl -d "$MEDIA_DEV" -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]' 2>/dev/null
+CAP_NAME="$(printf '%s\n' "$TOPO" | sed -n "/entity .*CSI2 ${CSI2_NUM} (/,/entity .*CSI2 /p" \
+    | grep -o 'Intel IPU6 ISYS Capture [0-9]*' | head -1)" || true
+if [ -z "$CAP_NAME" ]; then
+    die "Could not find ISYS capture node on $CSI2_PORT"
+fi
+
+CAPTURE_DEV="$(printf '%s\n' "$TOPO" | grep -A3 "entity.*${CAP_NAME}" \
+    | grep -o '/dev/video[0-9]*' | head -1)" || true
+if [ -z "$CAPTURE_DEV" ]; then
+    die "Could not resolve device node for ${CAP_NAME}"
+fi
+log "Capture device: ${CAPTURE_DEV} (${CAP_NAME})"
+
+media-ctl -d "$MEDIA_DEV" -V "${CSI2_PORT}:0 [fmt:SGRBG10_1X10/1920x1080]"
+media-ctl -d "$MEDIA_DEV" -V "${CSI2_PORT}:1 [fmt:SGRBG10_1X10/1920x1080]"
+media-ctl -d "$MEDIA_DEV" -l "${CSI2_PORT}:1 -> \"${CAP_NAME}\":0[1]" 2>/dev/null
 v4l2-ctl -d "$CAPTURE_DEV" --set-fmt-video=width=1920,height=1080,pixelformat=BA10
 
 log "Pipeline configured"
@@ -108,9 +126,13 @@ log "v4l2loopback at $LOOP_DEV"
 
 # ── Start C ISP (or fallback to Python virtualcam) ─────────────────
 
-log "Starting ISP (capture=$CAPTURE_DEV output=$LOOP_DEV)..."
+# Sensor mount orientation varies by laptop model. Override via
+# GC2607_ROTATION env in the systemd unit if your image is flipped:
+#   none | hflip (default) | rot180
+ROT="${GC2607_ROTATION:-hflip}"
+log "Starting ISP (capture=$CAPTURE_DEV output=$LOOP_DEV rotation=$ROT)..."
 if [ -x "${SCRIPT_DIR}/gc2607_isp" ]; then
-    exec "${SCRIPT_DIR}/gc2607_isp" "$CAPTURE_DEV" "$LOOP_DEV"
+    exec "${SCRIPT_DIR}/gc2607_isp" "$CAPTURE_DEV" "$LOOP_DEV" "$ROT"
 else
     # Fallback to Python virtualcam
     log "gc2607_isp not found, falling back to Python virtualcam"

@@ -15,8 +15,9 @@ SUDOERS_FILE="/etc/sudoers.d/gc2607-camera"
 
 echo "2. Creating sudoers configuration..."
 sudo tee "$SUDOERS_FILE" > /dev/null <<EOF
-# Allow $USER to manage camera driver without password
-$USER ALL=(ALL) NOPASSWD: /usr/bin/insmod /home/abbood/dev/camera-driver-dev/gc2607-v4l2-driver/gc2607.ko
+# Allow $USER to manage camera driver without password.
+# Adjust the insmod path if your gc2607.ko lives elsewhere.
+$USER ALL=(ALL) NOPASSWD: /usr/bin/insmod /opt/gc2607/gc2607.ko
 $USER ALL=(ALL) NOPASSWD: /usr/bin/rmmod gc2607
 $USER ALL=(ALL) NOPASSWD: /usr/bin/modprobe videodev
 $USER ALL=(ALL) NOPASSWD: /usr/bin/modprobe v4l2-async
