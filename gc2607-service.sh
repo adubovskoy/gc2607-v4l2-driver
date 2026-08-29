@@ -97,16 +97,19 @@ fi
 
 # Prefer /dev/video50 but fall back to whatever v4l2loopback grabs if 50 is
 # already taken (e.g. by an external USB webcam that enumerated first).
+# NOTE: exclusive_caps is deliberately NOT set. With exclusive_caps=1 the
+# device advertises only OUTPUT or only CAPTURE (whichever opens first).
+# WeMeet's Qt Multimedia opens it expecting a capture source; seeing an
+# OUTPUT-only node it silently shows a black frame and never reads.
+# Default (0) advertises both, which works for WeMeet and ffmpeg alike.
 modprobe v4l2loopback \
     devices=1 \
     video_nr=50 \
     card_label="GC2607 Camera" \
-    exclusive_caps=1 \
     max_buffers=2 \
     || modprobe v4l2loopback \
         devices=1 \
         card_label="GC2607 Camera" \
-        exclusive_caps=1 \
         max_buffers=2
 
 # Discover the actual loopback device by card label — robust against
@@ -126,13 +129,9 @@ log "v4l2loopback at $LOOP_DEV"
 
 # ── Start C ISP (or fallback to Python virtualcam) ─────────────────
 
-# Sensor mount orientation varies by laptop model. Override via
-# GC2607_ROTATION env in the systemd unit if your image is flipped:
-#   none | hflip (default) | rot180
-ROT="${GC2607_ROTATION:-hflip}"
-log "Starting ISP (capture=$CAPTURE_DEV output=$LOOP_DEV rotation=$ROT)..."
+log "Starting ISP (capture=$CAPTURE_DEV output=$LOOP_DEV)..."
 if [ -x "${SCRIPT_DIR}/gc2607_isp" ]; then
-    exec "${SCRIPT_DIR}/gc2607_isp" "$CAPTURE_DEV" "$LOOP_DEV" "$ROT"
+    exec "${SCRIPT_DIR}/gc2607_isp" "$CAPTURE_DEV" "$LOOP_DEV"
 else
     # Fallback to Python virtualcam
     log "gc2607_isp not found, falling back to Python virtualcam"
