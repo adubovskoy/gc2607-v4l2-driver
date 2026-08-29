@@ -3,8 +3,8 @@
 
 set -e
 
-KERNEL_VER="6.17.9-arch1-1"
-NEW_MODULE="/home/abbood/kernel/dev/linux-6.17.9/drivers/media/pci/intel/ipu-bridge.ko"
+KERNEL_VER="$(uname -r)"
+NEW_MODULE="$(pwd)/ipu-bridge.ko"
 SYSTEM_MODULE="/lib/modules/$KERNEL_VER/kernel/drivers/media/pci/intel/ipu-bridge.ko.zst"
 
 echo "==========================================="

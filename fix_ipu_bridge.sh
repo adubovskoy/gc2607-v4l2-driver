@@ -3,7 +3,7 @@
 
 set -e
 
-KERNEL_VER="6.17.9-arch1-1"
+KERNEL_VER="$(uname -r)"
 KERNEL_BUILD="/lib/modules/$KERNEL_VER/build"
 MODULE_SRC="$KERNEL_BUILD/drivers/media/pci/intel"
 MODULE_NAME="ipu-bridge"

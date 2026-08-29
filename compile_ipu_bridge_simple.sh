@@ -3,8 +3,8 @@
 
 set -e
 
-KERNEL_VER="6.17.9-arch1-1"
-KERNEL_SRC="$HOME/kernel/dev/linux-6.17.9"
+KERNEL_VER="$(uname -r)"
+KERNEL_SRC="/lib/modules/$KERNEL_VER/build"
 SOURCE_FILE="$KERNEL_SRC/drivers/media/pci/intel/ipu-bridge.c"
 
 echo "==========================================="

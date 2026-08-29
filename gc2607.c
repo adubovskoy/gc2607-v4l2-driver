@@ -39,9 +39,9 @@
 
 /* Exposure and gain limits */
 #define GC2607_EXPOSURE_MIN		4
-#define GC2607_EXPOSURE_MAX		2002	/* VTS - 1 (must be < VTS) */
+#define GC2607_EXPOSURE_MAX		1124	/* VTS - 1 (must be < VTS) */
 #define GC2607_EXPOSURE_STEP		1
-#define GC2607_EXPOSURE_DEFAULT		2002	/* Tested optimal for indoor use */
+#define GC2607_EXPOSURE_DEFAULT		600	/* indoor, capped by VTS */
 
 /* Gain is controlled via LUT index (0-16), not raw register values */
 #define GC2607_GAIN_MIN			0	/* LUT index 0 = 1.0x gain */
@@ -53,7 +53,7 @@
 #define GC2607_PIXEL_RATE		(672000000LL / 10 * 2)  /* 134.4 MHz */
 #define GC2607_LINK_FREQ		336000000LL  /* 672 Mbps / 2 lanes */
 #define GC2607_HTS			2048
-#define GC2607_VTS			2003  /* 1.5x from 1335 for 1.5x exposure (20 FPS) */
+#define GC2607_VTS			1125  /* 1080p30: 67.2 Mpix/s / (2048 * 1125) ≈ 29.2 FPS */
 #define GC2607_WIDTH			1920
 #define GC2607_HEIGHT			1080
 
@@ -251,8 +251,8 @@ static const struct gc2607_regval gc2607_1080p_30fps_regs[] = {
 	{0x0341, 0x6e},
 	{0x0342, 0x08},  /* HTS high byte */
 	{0x0343, 0x00},  /* HTS low byte = 2048 */
-	{0x0220, 0x07},  /* VTS high byte (2003 = 0x07d3 for 20 FPS) */
-	{0x0221, 0xd3},  /* VTS low byte */
+	{0x0220, 0x04},  /* VTS high byte (1125 = 0x0465 for 29.2 FPS) */
+	{0x0221, 0x65},  /* VTS low byte */
 	{0x0af4, 0x2b},
 	{0x0002, 0x30},
 	{0x00c3, 0x3c},

@@ -25,6 +25,17 @@ find_desktop_user() {
 
 for attempt in 1 2 3 4 5 6; do
     if read -r USER UID_NUM < <(find_desktop_user); then
+        # If PipeWire already sees the virtual camera, WirePlumber is
+        # fine as-is. Restarting it here would drop live media sessions
+        # (e.g. a running WeMeet/Teams call) — their UIs hang until the
+        # app is restarted. Only restart when the device is missing.
+        if runuser -u "$USER" -- env \
+            XDG_RUNTIME_DIR="/run/user/${UID_NUM}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${UID_NUM}/bus" \
+            wpctl status 2>/dev/null | grep -q "GC2607 Camera"; then
+            echo "[gc2607] GC2607 already visible to PipeWire; skipping wireplumber restart"
+            exit 0
+        fi
         runuser -u "$USER" -- env \
             XDG_RUNTIME_DIR="/run/user/${UID_NUM}" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${UID_NUM}/bus" \

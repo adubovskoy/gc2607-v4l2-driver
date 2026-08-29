@@ -26,13 +26,34 @@ Zoom, Slack, Google Meet, Telegram, etc.
 | Virtual output | YUYV 960×540 @ 30 fps on `/dev/video50` |
 | ACPI HID | `GCTI2607` |
 
+## Documentation
+
+- [`docs/diagnosis.md`](docs/diagnosis.md) — the full debugging trail:
+  why the camera was dead, and how each layer was isolated (ACPI sensor
+  enumeration, ipu_bridge table, media graph, userspace ISP).
+- [`docs/adaptation.md`](docs/adaptation.md) — adapting to your laptop:
+  orientation modes, CSI2 port detection, frame-rate/exposure trade-offs,
+  other sensors.
+
+## Notable fixes in this fork
+
+Three fixes on top of upstream that make the camera actually usable on
+other Meteor Lake boards:
+
+| Fix | Upstream state | This fork |
+|---|---|---|
+| **Frame rate** | `VTS=2003` (~16 fps; comment admits "1.5x exposure, 20 FPS") | `VTS=1125` → ~29 fps at 1080p30. Exposure capped at 900 lines; AE compensates with analogue gain. Also fixes a probe bug: `EXPOSURE_DEFAULT=2002` exceeded the new VTS cap and made the sensor fail to bind (`-ERANGE`). |
+| **Sensor orientation** | Hardcoded 180° rotation (author's inverted reference mount) | `gc2607_isp` takes a third argument: `none` / `hflip` (default) / `rot180`. Set `GC2607_ROTATION` in the systemd unit if your image is flipped. |
+| **Topology** | Service script hardcoded `CSI2 0` | Capture port and ISYS node are derived from the live media topology, so boards wiring GC2607 to `CSI2 4` (e.g. some MateBook/other units) work without edits. |
+
 ## What gets installed
 
 ```
 gc2607 sensor (SGRBG10 raw 10-bit Bayer)
-  → Intel IPU6 CSI2 0
-  → Intel IPU6 ISYS Capture 0  (/dev/videoN)
-  → gc2607_isp                 (C: demosaic + auto-WB + auto-AE + sRGB gamma)
+  → Intel IPU6 CSI2 <port>      (auto-detected from media topology)
+  → Intel IPU6 ISYS Capture <N> (/dev/videoN, auto-detected)
+  → gc2607_isp                 (C: demosaic + auto-WB + auto-AE + sRGB gamma;
+                                orientation: none|hflip|rot180)
   → v4l2loopback /dev/video50  ("GC2607 Camera", YUYV 960x540)
   → PipeWire                   → camera apps
 ```

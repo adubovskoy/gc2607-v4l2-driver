@@ -3,7 +3,7 @@
 
 set -e  # Exit on error
 
-KERNEL_VER="6.17.9"
+KERNEL_VER="$(uname -r)"
 KERNEL_DIR="$HOME/kernel/dev"
 KERNEL_SRC="$KERNEL_DIR/linux-$KERNEL_VER"
 IPU_BRIDGE_FILE=""

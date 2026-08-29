@@ -59,7 +59,11 @@
 
 /* Sensor hardware limits */
 #define EXPOSURE_MIN    4
-#define EXPOSURE_MAX    2002
+/* Cap exposure at ~27ms (900 sensor lines) so frame rate stays ~30fps
+ * in dim scenes. AE compensates with analogue gain (up to GAIN_MAX)
+ * once exposure hits the cap; without this cap dark scenes ramp
+ * exposure to 2002 (~62ms -> 16fps) and the stream feels laggy. */
+#define EXPOSURE_MAX    900
 #define GAIN_MIN        0
 #define GAIN_MAX        16
 
@@ -73,6 +77,16 @@
 #define CONSUMER_CHECK_INTERVAL_S  2.0
 
 static volatile sig_atomic_t running = 1;
+
+/* Sensor orientation handling: the GC2607 mount direction varies by
+ * laptop model (inverted, mirrored, or upright). rotation_mode selects
+ * how captured rows/columns map to the output:
+ *   ROT_NONE  - direct (upright, no mirror)
+ *   ROT_HFLIP - horizontal flip only (upright but mirrored)
+ *   ROT_180   - full 180 degree rotation (inverted mount)
+ * Configurable via argv[3] (see main()); defaults to ROT_HFLIP. */
+enum { ROT_NONE, ROT_HFLIP, ROT_180 };
+static int rotation_mode = ROT_HFLIP;
 
 /* inotify-based consumer tracking */
 static int inotify_fd = -1;
@@ -174,7 +188,6 @@ static inline void rgb_to_yuyv(uint8_t r0, uint8_t g0, uint8_t b0,
  *   Row 1: B G B G B G ...
  *
  * 2x2 binning: each 2x2 block -> one output pixel (R, avg(G1,G2), B).
- * 180 degree rotation: output rows/cols are reversed.
  *
  * Returns the subsampled green mean for AE.
  */
@@ -189,16 +202,18 @@ static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
     int stat_count = 0;
 
     /*
-     * Iterate output pixels in reverse for 180 degree rotation.
-     * Output row (OUT_H-1-oy) col (OUT_W-1-ox) maps to Bayer block at (oy*2, ox*2).
+     * Rotation modes (see rotation_mode):
+     *   ROT_NONE   - direct mapping (sensor mounted upright, no mirror)
+     *   ROT_HFLIP  - horizontal flip only (upright but mirrored)
+     *   ROT_180    - full 180 degree rotation (inverted mount)
      */
     for (int oy = 0; oy < OUT_H; oy++) {
         /* Bayer row pointers for this 2x2 block row */
         const uint16_t *row0 = bayer + (oy * 2) * SENSOR_W;
         const uint16_t *row1 = bayer + (oy * 2 + 1) * SENSOR_W;
 
-        /* Output row (flipped) */
-        int out_y = OUT_H - 1 - oy;
+        /* Output row: direct, or reversed for 180 degree rotation */
+        int out_y = (rotation_mode == ROT_180) ? OUT_H - 1 - oy : oy;
         uint8_t *out_row = yuyv_buf + out_y * OUT_W * 2;
 
         /* Process pairs of output pixels for YUYV packing */
@@ -234,10 +249,15 @@ static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
             uint8_t R0 = lut_r[r_0],  G0 = lut_g[gavg_0], B0 = lut_b[b_0];
             uint8_t R1 = lut_r[r_1],  G1 = lut_g[gavg_1], B1 = lut_b[b_1];
 
-            /* Write YUYV (flipped horizontally too for 180 degree rotation) */
-            int out_x = OUT_W - 2 - ox;
-            /* Swap pixel order within the pair for horizontal flip */
-            rgb_to_yuyv(R1, G1, B1, R0, G0, B0, out_row + out_x * 2);
+            /* Horizontal flip for ROT_HFLIP and ROT_180; direct for ROT_NONE */
+            int out_x;
+            if (rotation_mode == ROT_NONE) {
+                out_x = ox;
+                rgb_to_yuyv(R0, G0, B0, R1, G1, B1, out_row + out_x * 2);
+            } else {
+                out_x = OUT_W - 2 - ox;
+                rgb_to_yuyv(R1, G1, B1, R0, G0, B0, out_row + out_x * 2);
+            }
 
             /* Accumulate WB statistics (subsampled).
              * Skip pixels where ANY channel is saturated (>=1020) —
@@ -407,6 +427,20 @@ static void close_capture(int cap_fd, struct buffer *buffers, int n_buffers)
     close(cap_fd);
 }
 
+/*
+ * Output buffers: we stream via V4L2 mmap (VIDEO_OUTPUT) instead of
+ * write(). With write(), v4l2loopback marks the internal buffer set as
+ * mmap-mapped, and a concurrent CAPTURE reader's REQBUFS fails with
+ * EBUSY — which is exactly what WeMeet hits (it opens the device, the
+ * ISP starts write() streaming, WeMeet's REQBUFS -> EBUSY, then its
+ * DQBUF loops EINVAL -> black frame). mmap OUTPUT + mmap CAPTURE share
+ * the buffer set and coexist fine (verified with v4l2-ctl).
+ */
+#define OUT_BUFS 4
+static void *out_buffers[OUT_BUFS];
+static size_t out_lengths[OUT_BUFS];
+static int out_nbufs = 0;
+
 static int open_output(const char *dev)
 {
     int fd = open(dev, O_RDWR);
@@ -428,7 +462,72 @@ static int open_output(const char *dev)
         return -1;
     }
 
+    struct v4l2_requestbuffers req = {0};
+    req.count = OUT_BUFS;
+    req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+        perror("VIDIOC_REQBUFS output");
+        close(fd);
+        return -1;
+    }
+    out_nbufs = req.count;
+
+    for (int i = 0; i < out_nbufs; i++) {
+        struct v4l2_buffer buf = {0};
+        buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+            perror("VIDIOC_QUERYBUF output");
+            close(fd);
+            return -1;
+        }
+        out_lengths[i] = buf.length;
+        out_buffers[i] = mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, fd, buf.m.offset);
+        if (out_buffers[i] == MAP_FAILED) {
+            perror("mmap output");
+            close(fd);
+            return -1;
+        }
+    }
+
+    /* Queue all output buffers for the writer */
+    for (int i = 0; i < out_nbufs; i++) {
+        struct v4l2_buffer buf = {0};
+        buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+            perror("VIDIOC_QBUF output");
+            close(fd);
+            return -1;
+        }
+    }
+
     return fd;
+}
+
+/* Write one YUYV frame to the output via mmap OUTPUT streaming. */
+static int write_output_frame(int out_fd)
+{
+    struct v4l2_buffer buf = {0};
+    buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    buf.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(out_fd, VIDIOC_DQBUF, &buf) < 0) {
+        if (errno == EAGAIN)
+            return 0;
+        perror("VIDIOC_DQBUF output");
+        return -1;
+    }
+    memcpy(out_buffers[buf.index], yuyv_buf, sizeof(yuyv_buf));
+    buf.bytesused = sizeof(yuyv_buf);
+    if (xioctl(out_fd, VIDIOC_QBUF, &buf) < 0) {
+        perror("VIDIOC_QBUF output");
+        return -1;
+    }
+    return 0;
 }
 
 /*
@@ -602,6 +701,8 @@ static int streaming_loop(const char *capture_dev, int out_fd,
         );
 
         if (has_subdev && elapsed >= AE_INTERVAL_S) {
+            int prev_exposure = cur_exposure;
+            int prev_gain = cur_gain;
             if (brightness > 2.5f) {
                 if (cur_exposure < EXPOSURE_MAX) {
                     cur_exposure = (int)(cur_exposure * 1.5);
@@ -611,23 +712,30 @@ static int streaming_loop(const char *capture_dev, int out_fd,
                     cur_gain += 2;
                     if (cur_gain > GAIN_MAX) cur_gain = GAIN_MAX;
                 }
-                set_sensor_controls(subdev_path, cur_exposure, cur_gain);
-                brightness = 1.0f;
+                /* Only reset software brightness if hardware actually
+                 * changed. At EXPOSURE_MAX + GAIN_MAX there is nothing
+                 * more to do — resetting brightness here would push it
+                 * back to 1.0, then AE re-ramps it past 2.5 again,
+                 * causing a visible periodic flicker in dim scenes. */
+                if (cur_exposure != prev_exposure || cur_gain != prev_gain) {
+                    set_sensor_controls(subdev_path, cur_exposure, cur_gain);
+                    brightness = 1.0f;
+                }
             } else if (brightness < 0.8f && (cur_exposure > EXPOSURE_MIN || cur_gain > GAIN_MIN)) {
                 cur_exposure = (int)(cur_exposure * 0.7);
                 if (cur_exposure < EXPOSURE_MIN) cur_exposure = EXPOSURE_MIN;
                 if (cur_exposure == EXPOSURE_MIN && cur_gain > GAIN_MIN)
                     cur_gain = cur_gain - 1 >= GAIN_MIN ? cur_gain - 1 : GAIN_MIN;
-                set_sensor_controls(subdev_path, cur_exposure, cur_gain);
-                brightness = 1.0f;
+                if (cur_exposure != prev_exposure || cur_gain != prev_gain) {
+                    set_sensor_controls(subdev_path, cur_exposure, cur_gain);
+                    brightness = 1.0f;
+                }
             }
             last_ae_time = now;
         }
 
         /* Write YUYV to v4l2loopback */
-        ssize_t written = write(out_fd, yuyv_buf, sizeof(yuyv_buf));
-        if (written < 0 && errno != EAGAIN) {
-            perror("write output");
+        if (write_output_frame(out_fd) < 0) {
             break;
         }
 
@@ -680,6 +788,23 @@ int main(int argc, char *argv[])
     const char *capture_dev = argc > 1 ? argv[1] : "/dev/video1";
     const char *output_dev  = argc > 2 ? argv[2] : "/dev/video50";
 
+    /* Optional third arg: rotation mode (none|hflip|rot180) */
+    if (argc > 3) {
+        if (strcmp(argv[3], "none") == 0)
+            rotation_mode = ROT_NONE;
+        else if (strcmp(argv[3], "hflip") == 0)
+            rotation_mode = ROT_HFLIP;
+        else if (strcmp(argv[3], "rot180") == 0)
+            rotation_mode = ROT_180;
+        else
+            fprintf(stderr, "[gc2607_isp] Unknown rotation mode '%s' (use none|hflip|rot180); using hflip\n",
+                    argv[3]);
+    }
+
+    printf("[gc2607_isp] rotation mode: %s\n",
+           rotation_mode == ROT_NONE ? "none" :
+           rotation_mode == ROT_HFLIP ? "hflip" : "rot180");
+
     /* Line-buffered stdout so logs appear in journald */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
@@ -699,6 +824,11 @@ int main(int argc, char *argv[])
 
     /* Open output device (kept open for the lifetime of the process) */
     int out_fd = open_output(output_dev);
+
+    /* Start the OUTPUT stream so CAPTURE readers can STREAMON */
+    enum v4l2_buf_type out_type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    if (xioctl(out_fd, VIDIOC_STREAMON, &out_type) < 0)
+        perror("VIDIOC_STREAMON output");
     if (out_fd < 0)
         return 1;
 
@@ -730,7 +860,7 @@ int main(int argc, char *argv[])
         yuyv_buf[i + 3] = 128;  /* V  */
     }
     /* Write initial standby frame so wireplumber can probe successfully */
-    write(out_fd, yuyv_buf, sizeof(yuyv_buf));
+    write_output_frame(out_fd);
 
     printf("[gc2607_isp] Idle, waiting for consumers on %s...\n", output_dev);
 
@@ -766,7 +896,7 @@ int main(int argc, char *argv[])
                        output_dev);
         } else {
             /* Write standby frame to keep v4l2loopback alive */
-            write(out_fd, yuyv_buf, sizeof(yuyv_buf));
+            write_output_frame(out_fd);
         }
     }
 
